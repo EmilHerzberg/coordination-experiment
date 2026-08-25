@@ -1,0 +1,146 @@
+// The three-rung ladder (working document §3) on the five-bucket ledger.
+//
+//   rung 1  repetition   N independent workers, probabilities combined by formula
+//   rung 2  aggregator   the SAME N workers' <reason> texts (numbers withheld)
+//                        → one aggregating agent
+//   rung 3  debate       the SAME N workers as round 0, then R revision rounds
+//                        in which every agent reads the peers' FULL answers
+//
+// Shared worker runs (working doc §3.3): one set of worker calls serves as
+// rung 1, as the input of rung 2, and as round 0 of rung 3. In the ledger the
+// worker records carry structure='workers'; a structure's totals are
+// workers + its own extra calls (see `structureRecords`).
+
+import type { LLMClient } from '../src/types.js';
+import { Ledger5, MalformedCallError, type CallLedgerRecord, type LedgerCallResult } from './ledger5.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts-draft.js';
+
+export interface LadderParams {
+  agentCount: number;          // N
+  debateRounds: number;        // R revision rounds after round 0
+  temperature: number;
+  maxTokensPerCall?: number;
+  /** [SESSION] formula for rung 1 and the debate's final round. Working doc says "averaged". */
+  aggregate: 'mean' | 'median';
+}
+
+export const COMBINER_ROLES = ['aggregator'];
+export const STRUCTURES = ['repetition', 'aggregator', 'debate'] as const;
+export type StructureName = typeof STRUCTURES[number];
+
+export interface StructureOutcome {
+  probability: number | null;   // null = dropped (malformed)
+  dropped: boolean;
+  dropReason?: string;
+}
+
+export interface EventRunResult {
+  eventId: string;
+  modelKey: string;
+  outcomes: Record<StructureName, StructureOutcome>;
+  ledger: Ledger5;
+}
+
+export function combine(ps: number[], how: 'mean' | 'median'): number {
+  if (ps.length === 0) throw new Error('combine(): empty');
+  if (how === 'mean') return ps.reduce((a, b) => a + b, 0) / ps.length;
+  const s = ps.slice().sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+/** Records that belong to a structure's cost = shared workers + own calls. */
+export function structureRecords(all: CallLedgerRecord[], s: StructureName): CallLedgerRecord[] {
+  return all.filter(r => r.structure === 'workers' || r.structure === s);
+}
+
+/**
+ * Run all three rungs for one event on one model. Malformed calls (after the
+ * single retry) drop the affected structure(s); a malformed WORKER drops all
+ * three, since all three depend on the worker set.
+ */
+export async function runLadder(
+  llm: LLMClient,
+  ev: EvidencePack,
+  modelKey: string,
+  p: LadderParams,
+): Promise<EventRunResult> {
+  const ledger = new Ledger5('workers', ev.id, modelKey);
+  const N = p.agentCount;
+  const outcomes = {} as Record<StructureName, StructureOutcome>;
+  const drop = (why: string): StructureOutcome => ({ probability: null, dropped: true, dropReason: why });
+
+  // ---- shared workers (rung 1 / rung 2 input / debate round 0)
+  // allSettled: wait for ALL sibling calls so no record lands after we return.
+  const workerSettled = await Promise.allSettled(
+    Array.from({ length: N }, (_, i) =>
+      ledger.call(llm, `worker_${i + 1}`, workerPrompt(ev), {
+        maxTokens: p.maxTokensPerCall, temperature: p.temperature, round: 0,
+      }),
+    ),
+  );
+  const workerFail = firstFailure(workerSettled, 'worker');
+  if (workerFail) {
+    for (const s of STRUCTURES) outcomes[s] = drop(workerFail);
+    return { eventId: ev.id, modelKey, outcomes, ledger };
+  }
+  const workers = workerSettled.map(r => (r as PromiseFulfilledResult<LedgerCallResult>).value);
+  outcomes.repetition = {
+    probability: combine(workers.map(w => w.parsed.probability), p.aggregate),
+    dropped: false,
+  };
+
+  // ---- rung 2: aggregator reads <reason> only
+  {
+    const sub = withStructure(ledger, 'aggregator');
+    try {
+      const r = await sub.call(llm, 'aggregator', aggregatorPrompt(ev, workers.map(w => w.parsed.reason)), {
+        maxTokens: p.maxTokensPerCall, temperature: p.temperature,
+      });
+      outcomes.aggregator = { probability: r.parsed.probability, dropped: false };
+    } catch (e) {
+      outcomes.aggregator = drop(e instanceof MalformedCallError ? e.message : `aggregator error: ${(e as Error).message}`);
+    }
+  }
+
+  // ---- rung 3: debate, round 0 = workers, then R revision rounds with FULL answers
+  {
+    const sub = withStructure(ledger, 'debate');
+    let states = workers.map((w, i) => ({ agentId: String(i + 1), fullText: w.fullVisible, probability: w.parsed.probability }));
+    let failed: string | null = null;
+    for (let round = 1; round <= p.debateRounds && !failed; round++) {
+      const settled = await Promise.allSettled(
+        states.map((own, i) => {
+          const peers = states.filter((_, j) => j !== i).map(s => ({ agentId: s.agentId, fullText: s.fullText }));
+          return sub
+            .call(llm, `debater_${own.agentId}`, debateRevisePrompt(ev, own, peers, round), {
+              maxTokens: p.maxTokensPerCall, temperature: p.temperature, round,
+            })
+            .then(r => ({ agentId: own.agentId, fullText: r.fullVisible, probability: r.parsed.probability }));
+        }),
+      );
+      failed = firstFailure(settled, 'debate');
+      if (!failed) states = settled.map(r => (r as PromiseFulfilledResult<typeof states[number]>).value);
+    }
+    outcomes.debate = failed
+      ? drop(failed)
+      : { probability: combine(states.map(s => s.probability), p.aggregate), dropped: false };
+  }
+
+  return { eventId: ev.id, modelKey, outcomes, ledger };
+}
+
+function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): string | null {
+  for (const r of settled) {
+    if (r.status === 'rejected') {
+      const e = r.reason;
+      return e instanceof MalformedCallError ? e.message : `${what} error: ${(e as Error)?.message ?? String(e)}`;
+    }
+  }
+  return null;
+}
+
+/** A view on the same ledger that stamps a different structure name on new records. */
+function withStructure(base: Ledger5, structure: StructureName): Ledger5 {
+  return new Ledger5(structure, base.eventId, base.modelKey, base.records);
+}

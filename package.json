@@ -44,10 +44,11 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",
+    "js-tiktoken": "^1.0.21",
     "zod": "^4.3.6"
   }
 }
