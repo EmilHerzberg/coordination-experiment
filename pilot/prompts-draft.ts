@@ -19,16 +19,26 @@
 import type { Segment, SegmentedPrompt } from './ledger5.js';
 
 // ---------------------------------------------------------------- D: base
-// [SESSION] wording of the base instruction; whether to mention "calibrated";
-//           whether to forbid disclaimers; anything task-specific (5-day AR).
+// A1 FULLY CLOSED 2026-08-25 — sentence-by-sentence rationale in
+// DECISIONS_PROMPT_SESSION.md: D2 (leakage stance), D3 (each sentence),
+// D5 (calibration, anchor-free + Brier), D8 (AR definition = minus market,
+// beta item resolved; working doc §2.2 amended to match).
 export const BASE_SYSTEM = `\
 You are a financial analyst. A company has just published its quarterly earnings. \
 Using only the information given to you, estimate the probability that the stock's \
 abnormal return over the next five trading days is positive. Abnormal return means \
-the stock's return minus what the market would have implied for it. \
-Be calibrated: when you say 70%, such events should occur about 70% of the time.`;
+the stock's five-day return minus the five-day return of the market (S&P 500). \
+Your reasoning must consist of clearly followable arguments. Each argument must \
+state the specific data from your input that it builds on, so that your reasoning \
+can be followed and the data you use is documented. \
+Your probability is a frequency statement, not a figure of speech, and it is graded \
+with a proper scoring rule (the Brier score): if you state a probability p, such \
+events should occur in about a fraction p of comparable cases. \
+Do not write disclaimers about uncertainty being inherent; quantify the uncertainty \
+in your probability instead.`;
 
-// [SESSION] exact wording of the format contract; whether examples are given.
+// A2 CLOSED 2026-08-25 (D6): empty template only — no filled example (anchoring),
+// percent safety net stays unadvertised, strict "and nothing else".
 export const FORMAT_INSTRUCTION = `\
 Answer in exactly two tagged sections and nothing else:
 <reason>
@@ -38,18 +48,26 @@ Your reasoning, as long or short as you need.
 A single number between 0 and 1.
 </decision>`;
 
-/** The question line placed after the evidence. */
+// A3 CLOSED 2026-08-25 (D7): question restated after the evidence (long-prompt
+// recency) PLUS a format reminder sentence (author's addition).
 export const QUESTION_LINE = `\
-Question: what is the probability that this stock's abnormal return over the next five trading days is positive?`;
+Question: what is the probability that this stock's abnormal return over the next five trading days is positive?
+Answer in exactly the two tagged sections specified above.`;
 
 // ---------------------------------------------------------- A: coordination
-// [SESSION] aggregator role text; whether it is told how many workers; whether
-//           it is told that the workers' probabilities were withheld.
+// A4 CLOSED 2026-08-25 (D10): explicit asymmetry + numbers withheld + data-
+// provenance bridge. No "do not simply average" line — "weigh / note conflicts"
+// already carries that job without hinting that numbers might be hidden in the text.
+// NOTE: the aggregator's system prompt is BASE_SYSTEM + this role + FORMAT, so it
+// inherits task, AR definition, grounding, calibration and anti-hedging verbatim.
 export const AGGREGATOR_ROLE = (n: number) => `\
-You are the aggregating analyst. ${n} independent analysts have each written their \
-reasoning about the same earnings release. You are shown their reasoning sections \
-verbatim, without their final numbers. Weigh their arguments, note where they \
-conflict, and form your own probability from the reasoning.`;
+In this task you are aggregating the work of ${n} analysts who have each read the \
+source material and written their reasoning about the same earnings release. You do \
+not see the source material yourself. You are shown their reasoning sections verbatim, without \
+their final numbers. The data cited inside their reasoning is taken from that source \
+material, so you can reason both about their arguments and about the data those \
+arguments rest on. Weigh their arguments, note where they conflict, and form the \
+final probability from their reasoning.`;
 
 // [SESSION] debate revise text; how strongly to push back on convergence.
 export const DEBATE_REVISE_ROLE = `\
@@ -59,7 +77,8 @@ reasoning convinces you and hold it where it does not. State disagreement openly
 Do not converge merely to converge.`;
 
 // ---------------------------------------------------------- toggles [SESSION]
-/** Does the aggregator ALSO see the evidence? Pilot: no (workers' text only). */
+/** DECIDED 2026-08-25 (D1, DECISIONS_PROMPT_SESSION.md): blind aggregator per exposé p.3.
+ *  Mitigation lives in BASE_SYSTEM (data-grounded reasoning). Do not flip. */
 export const AGGREGATOR_SEES_EVIDENCE = false;
 /** Does a debating agent see its own previous answer again? (Du et al.: yes.) */
 export const DEBATE_SHOWS_OWN_PRIOR = true;
