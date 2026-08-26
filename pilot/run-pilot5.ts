@@ -39,14 +39,39 @@ interface ModelSpec {
   priceIn: number; priceOut: number;
 }
 
-// Same roster as pilot v1 (models_verified.md). Prices are for the estimate only;
-// real cost comes from the provider's usage.cost.
+// EXPERIMENT ROSTER — decided 2026-08-26 (D20). Two open-weight families, one
+// reasoning arm and one non-reasoning arm, exactly as the exposé's Scope section
+// requires. Both served by DeepInfra; prices and quantisation re-verified live
+// against the OpenRouter endpoints API on 2026-08-26.
+//
+// The two arms differ in family, parameter scale (32B dense vs 671B MoE) AND
+// serving precision (fp8 vs fp4). This is a DELIBERATE, author-approved choice:
+// RQ3's model contrast is explicitly exploratory and the models are declared
+// not directly comparable in the limitations (see DECISIONS_PROMPT_SESSION.md
+// D20). RQ1 and RQ2 are unaffected — they are within-model comparisons.
+//
+// Prices here are for the offline estimate only; real cost comes from usage.cost.
 export const MODELS: ModelSpec[] = [
-  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                     provider: 'SiliconFlow', mode: 'reason_on',  arm: 'reasoning',     evidence: 'all',   priceIn: 0.14, priceOut: 0.57 },
-  { key: 'qwen3-32b@off',         slug: 'qwen/qwen3-32b',                     provider: 'SiliconFlow', mode: 'reason_off', arm: 'non-reasoning', evidence: 'all',   priceIn: 0.14, priceOut: 0.57 },
-  { key: 'llama-3.3-70b',         slug: 'meta-llama/llama-3.3-70b-instruct',  provider: 'Crusoe',      mode: 'none',       arm: 'non-reasoning', evidence: 'all',   priceIn: 0.25, priceOut: 0.75 },
-  { key: 'deepseek-r1-0528',      slug: 'deepseek/deepseek-r1-0528',          provider: 'DeepInfra',   mode: 'reason_on',  arm: 'reasoning',     evidence: 'first', priceIn: 0.50, priceOut: 2.15 },
-  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324',     provider: 'Crusoe',      mode: 'none',       arm: 'non-reasoning', evidence: 'first', priceIn: 0.50, priceOut: 1.50 },
+  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28 },
+  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324', provider: 'DeepInfra', mode: 'none',      arm: 'non-reasoning', evidence: 'all', priceIn: 0.24, priceOut: 0.90 },
+];
+
+/**
+ * Verified alternatives kept out of the roster but available for a robustness
+ * check or a substitution if a host drops a model (D9 requires that the served
+ * checkpoint be pinned, so any swap must be re-verified and recorded):
+ *   llama-3.3-70b   meta-llama/llama-3.3-70b-instruct  DeepInfra fp8  0.10/0.32
+ *   deepseek-r1     deepseek/deepseek-r1-0528          SiliconFlow fp8 0.50/2.18
+ *                   (NOTE: DeepInfra serves r1 at fp4 for the same price —
+ *                    SiliconFlow's fp8 is strictly better value if r1 is used.)
+ *   qwen3-32b@off   qwen/qwen3-32b                     SiliconFlow fp8 0.14/0.57
+ *                   (the on/off toggle only works on SiliconFlow; DeepInfra
+ *                    ignores reasoning:{enabled:false} and keeps thinking on.)
+ */
+export const RESERVE_MODELS: ModelSpec[] = [
+  { key: 'llama-3.3-70b',  slug: 'meta-llama/llama-3.3-70b-instruct', provider: 'DeepInfra',   mode: 'none',       arm: 'non-reasoning', evidence: 'first', priceIn: 0.10, priceOut: 0.32 },
+  { key: 'deepseek-r1',    slug: 'deepseek/deepseek-r1-0528',         provider: 'SiliconFlow', mode: 'reason_on',  arm: 'reasoning',     evidence: 'first', priceIn: 0.50, priceOut: 2.18 },
+  { key: 'qwen3-32b@off',  slug: 'qwen/qwen3-32b',                    provider: 'SiliconFlow', mode: 'reason_off', arm: 'non-reasoning', evidence: 'first', priceIn: 0.14, priceOut: 0.57 },
 ];
 
 export const PARAMS: LadderParams = {
@@ -160,7 +185,7 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
 
 async function main(): Promise<void> {
   if (MODE === 'estimate') { estimate(); return; }
-  if (MODE === 'probe') { await run([process.env.PILOT5_PROBE_MODEL ?? 'qwen3-32b@off'], 1); return; }
+  if (MODE === 'probe') { await run([process.env.PILOT5_PROBE_MODEL ?? 'qwen3-32b@on'], 1); return; }
   if (MODE === 'full') { await run(MODELS.map(m => m.key), null); return; }
   throw new Error(`unknown mode ${MODE}`);
 }
