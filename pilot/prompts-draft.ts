@@ -1,8 +1,11 @@
 // =====================================================================
-//  DRAFT PROMPTS — NOT FINAL. To be worked out together in the prompt
-//  session before the pilot rerun. Everything that a model READS lives in
-//  this one file so that the wording can be changed without touching the
-//  ledger or the structures.
+//  PROMPTS — WORDING FROZEN 2026-08-26 (prompt session A1-A6, B1-B2).
+//  Every decision, with the reasoning on both sides and the rejected
+//  alternatives, is in ../../DECISIONS_PROMPT_SESSION.md (D1-D13).
+//  Do not change wording here without adding a numbered entry there.
+//
+//  Everything a model READS lives in this one file, so wording can change
+//  without touching the ledger or the structures.
 //
 //  Every function returns SEGMENTS, each tagged with its ledger bucket:
 //    D       evidence + base instruction (what a lone forecaster needs anyway)
@@ -13,7 +16,6 @@
 //  moves between D and A, its tokens move between buckets. That is the
 //  point: the classification is made here, once, in the open.
 //
-//  Open items for the prompt session are marked  // [SESSION] .
 // =====================================================================
 
 import type { Segment, SegmentedPrompt } from './ledger5.js';
@@ -69,18 +71,26 @@ material, so you can reason both about their arguments and about the data those 
 arguments rest on. Weigh their arguments, note where they conflict, and form the \
 final probability from their reasoning.`;
 
-// [SESSION] debate revise text; how strongly to push back on convergence.
+// A5 CLOSED 2026-08-26 (D11): N&S anti-convergence wording chosen by the author
+// over the assistant's neutral recommendation. Trade-off logged in
+// DECISIONS_PROMPT_SESSION.md D11 — preserved diversity would be confounded with
+// the instruction, but a collapse observed DESPITE this instruction is a stronger
+// finding, and it keeps the debate comparable with N&S, whose harness this is.
+// No persona restatement (D10 amendment). Mentions the own prior => requires B2=true.
 export const DEBATE_REVISE_ROLE = `\
-You are one analyst in a small group. Below are the other analysts' full answers \
-to the same question, and your own earlier answer. Revise your estimate where their \
-reasoning convinces you and hold it where it does not. State disagreement openly. \
-Do not converge merely to converge.`;
+In this task you are one of several analysts answering the same question. Below are \
+the other analysts' full answers and your own earlier answer. Revise your estimate \
+where their reasoning convinces you, and keep it where it does not. State \
+disagreement openly. Do not converge merely to converge.`;
 
-// ---------------------------------------------------------- toggles [SESSION]
+// ------------------------------------------------- structural toggles (closed)
 /** DECIDED 2026-08-25 (D1, DECISIONS_PROMPT_SESSION.md): blind aggregator per exposé p.3.
  *  Mitigation lives in BASE_SYSTEM (data-grounded reasoning). Do not flip. */
 export const AGGREGATOR_SEES_EVIDENCE = false;
-/** Does a debating agent see its own previous answer again? (Du et al.: yes.) */
+/** B2 CLOSED 2026-08-26 (D12): YES — Du et al. standard; "keep your estimate" (D11)
+ *  presupposes knowing it, and models carry no memory between calls. Logged as
+ *  B_SELF; whether B_SELF counts toward headline comm cost is deferred to the
+ *  analysis plan (both figures are always recorded). Do not flip. */
 export const DEBATE_SHOWS_OWN_PRIOR = true;
 
 // ============================================================ builders
@@ -130,7 +140,10 @@ export function aggregatorPrompt(ev: EvidencePack, workerReasons: string[]): Seg
   };
 }
 
-/** Rung 3 debate revision: base + revise role (A), evidence (D), peers' full answers (B), own prior (B_SELF). */
+/** Rung 3 debate revision: base + revise role (A), evidence (D), peers' full answers (B), own prior (B_SELF).
+ *  A6 CLOSED 2026-08-26 (D13): navigation headers kept as drafted, including the
+ *  round number — the TOTAL round count is never revealed, so it carries no
+ *  strategic signal about being near the end. */
 export function debateRevisePrompt(
   ev: EvidencePack,
   own: { agentId: string; fullText: string },
