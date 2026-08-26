@@ -111,12 +111,18 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push('## Malformed attempts');
   L.push('');
+  L.push("_Split by cause (D16). `truncated` means the answer hit our per-call token cap so no closing tag was written — that is the cap being too low, not the model failing to comply, and the remedy is raising the cap rather than dropping the event. `format` is the only genuine model failure. Infrastructure errors (5xx, timeouts, rate limits) never appear here; the client retries them itself._");
+  L.push('');
   const bad = records.filter(r => r.malformed);
+  const okRecords = records.filter(r => r.ok);
+  const retried = okRecords.filter(r => r.attempt > 1);
+  L.push(`Attempts: ${okRecords.length} usable calls, of which ${retried.length} needed more than one attempt (max attempt used: ${Math.max(0, ...okRecords.map(r => r.attempt))}). Failed attempts: ${bad.filter(r => r.failureKind === 'format').length} format, ${bad.filter(r => r.failureKind === 'truncated').length} truncated.`);
+  L.push('');
   if (!bad.length) L.push('none');
   else {
-    L.push('| model | event | role | attempt | error | tokens |');
-    L.push('|---|---|---|---:|---|---:|');
-    for (const r of bad) L.push(`| ${r.modelKey} | ${r.eventId} | ${r.agentRole} | ${r.attempt} | ${r.parseError} | ${r.totalTokens} |`);
+    L.push('| model | event | role | attempt | cause | finish_reason | error | tokens |');
+    L.push('|---|---|---|---:|---|---|---|---:|');
+    for (const r of bad) L.push(`| ${r.modelKey} | ${r.eventId} | ${r.agentRole} | ${r.attempt} | ${r.failureKind ?? '?'} | ${r.finishReason ?? '-'} | ${r.parseError} | ${r.totalTokens} |`);
   }
   L.push('');
   return L.join('\n');

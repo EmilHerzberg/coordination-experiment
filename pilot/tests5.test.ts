@@ -10,7 +10,7 @@ import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts-dr
 import { runLadder, structureRecords, COMBINER_ROLES } from './structures5.js';
 
 // ------------------------------------------------------------------ mock
-type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number };
+type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number; finishReason?: string };
 
 /** Mock client: token counts derived from the local tokenizer plus a fixed template overhead. */
 function mockClient(script: Script, overhead = 7): LLMClient & { calls: GenerateRequest[] } {
@@ -23,7 +23,7 @@ function mockClient(script: Script, overhead = 7): LLMClient & { calls: Generate
       const promptTokens = localTokens(req.systemPrompt) + localTokens(req.userPrompt) + overhead;
       const reasoningTokens = out.reasoningTokens ?? 0;
       const completionTokens = localTokens(out.content) + reasoningTokens;
-      const extras: ProviderExtras = { reasoningTokens, reasoningText: out.reasoning ?? '', content: out.content };
+      const extras: ProviderExtras = { reasoningTokens, reasoningText: out.reasoning ?? '', content: out.content, finishReason: out.finishReason ?? 'stop' };
       const res: GenerateResponse & { extras: ProviderExtras } = {
         text: out.content, toolCalls: [],
         usage: { promptTokens, completionTokens, totalTokens: promptTokens + completionTokens },
@@ -223,4 +223,50 @@ test('a worker failure still returns a usable (empty) roundProbabilities', async
   const bad = mockClient(req => (req.metadata?.agentRole === 'worker_2' ? { content: 'nope' } : { content: good(0.5) }));
   const r = await runLadder(bad, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
   assert.deepEqual(r.roundProbabilities, []);
+});
+
+// ------------------------------ D16 amendment: configurable retries + taxonomy
+test('maxParseAttempts allows more than one retry; every attempt is recorded', async () => {
+  let n = 0;
+  const llm = mockClient(() => { n++; return { content: n < 4 ? 'no tags at all' : good(0.42) }; });
+  const led = new Ledger5('workers', 'E1', 'mock');
+  const r = await led.call(llm, 'worker_1', workerPrompt(EV), { temperature: 0.7, maxAttempts: 4 });
+  assert.equal(r.parsed.probability, 0.42);
+  assert.equal(led.records.length, 4, 'all four attempts booked');
+  assert.equal(led.records[3].attempt, 4);
+  assert.ok(led.records.slice(0, 3).every(x => x.malformed));
+  // identical prompt on every retry - the property that keeps retrying legitimate
+  assert.deepEqual(llm.calls[0], llm.calls[3], 'retries must re-send the identical prompt');
+  const t = summarize(led.records);
+  assert.equal(t.calls, 1);
+  assert.equal(t.malformedAttempts, 3);
+  assert.equal(t.retriedCalls, 1);
+  assert.equal(t.maxAttemptUsed, 4);
+});
+
+test('maxAttempts is floored at 2 - the pre-registered minimum of one retry', async () => {
+  let n = 0;
+  const llm = mockClient(() => { n++; return { content: n === 1 ? 'nope' : good(0.5) }; });
+  const led = new Ledger5('workers', 'E1', 'mock');
+  const r = await led.call(llm, 'worker_1', workerPrompt(EV), { temperature: 0.7, maxAttempts: 1 });
+  assert.equal(r.parsed.probability, 0.5, 'a retry happened despite maxAttempts=1');
+  assert.equal(led.records.length, 2);
+});
+
+test('failure taxonomy separates truncation from a genuine format failure', async () => {
+  const truncated = mockClient(() => ({ content: '<reason>I was cut off mid sen', finishReason: 'length' }));
+  const led1 = new Ledger5('workers', 'E1', 'mock');
+  await assert.rejects(led1.call(truncated, 'worker_1', workerPrompt(EV), { temperature: 0.7 }), MalformedCallError);
+  assert.ok(led1.records.every(r => r.failureKind === 'truncated'), 'cap hit => truncated, not a model failure');
+  assert.ok(led1.records.every(r => r.finishReason === 'length'));
+  const t1 = summarize(led1.records);
+  assert.equal(t1.failTruncated, 2);
+  assert.equal(t1.failFormat, 0);
+
+  const prose = mockClient(() => ({ content: 'I think it is about 60 percent.', finishReason: 'stop' }));
+  const led2 = new Ledger5('workers', 'E1', 'mock');
+  await assert.rejects(led2.call(prose, 'worker_1', workerPrompt(EV), { temperature: 0.7 }), MalformedCallError);
+  const t2 = summarize(led2.records);
+  assert.equal(t2.failFormat, 2);
+  assert.equal(t2.failTruncated, 0);
 });

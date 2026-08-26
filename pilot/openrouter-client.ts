@@ -211,8 +211,8 @@ export class OpenRouterClient implements LLMClient {
       modelId: `${this.opts.modelSlug}@${data.provider ?? this.opts.provider}`,
       durationMs,
       // Five-bucket ledger reads these (raw content, no parse hacks applied).
-      extras: { reasoningTokens, reasoningText: reasoning || thinkText, content },
-    } as GenerateResponse & { extras: { reasoningTokens: number; reasoningText: string; content: string } };
+      extras: { reasoningTokens, reasoningText: reasoning || thinkText, content, finishReason: choice.finish_reason ?? null },
+    } as GenerateResponse & { extras: { reasoningTokens: number; reasoningText: string; content: string; finishReason: string | null } };
   }
 
   private log(record: Record<string, unknown>): void {

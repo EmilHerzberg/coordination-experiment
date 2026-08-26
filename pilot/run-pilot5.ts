@@ -53,7 +53,8 @@ export const PARAMS: LadderParams = {
   debateRounds: 2,        // round 0 (= workers) + 2 revisions
   temperature: 0.7,
   maxTokensPerCall: 8000,   // r1 traces run 1.5-3k hidden tokens; leave headroom so truncation never causes "malformed"
-  aggregate: 'mean',      // [SESSION]
+  maxParseAttempts: 2,    // D16: pre-registered MINIMUM (1 retry); may be raised, every attempt logged
+  aggregate: 'mean',      // [SESSION] B5 still open
 };
 
 function status(line: string): void {

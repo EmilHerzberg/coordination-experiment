@@ -73,10 +73,14 @@ export interface CallLedgerRecord {
   modelKey: string;
   agentRole: string;
   round: number | null;
-  attempt: number;             // 1 = first try, 2 = the single retry
+  attempt: number;             // 1 = first try, 2.. = retries
   ok: boolean;                 // parsed fine
   malformed: boolean;          // this attempt failed to parse
   parseError?: string;
+  /** Set on failed attempts only. See FailureKind. */
+  failureKind?: FailureKind;
+  /** Provider finish_reason for this attempt, verbatim. */
+  finishReason?: string | null;
   read: ReadSideCounts;
   write: WriteSideCounts;
   totalTokens: number;
@@ -110,7 +114,21 @@ export interface ProviderExtras {
   reasoningTokens: number;
   reasoningText: string;
   content: string;
+  /** OpenRouter finish_reason: 'stop' | 'length' | … — used for the failure taxonomy. */
+  finishReason?: string | null;
 }
+
+/**
+ * Why a call failed to yield a usable answer (D16 amendment, 2026-08-26).
+ * Kept apart because only 'format' is a genuine model failure:
+ *  - 'truncated'  the answer hit our per-call token cap, so the closing tag was
+ *                 never written. That is OUR cap being too low, not the model
+ *                 failing; the remedy is raising the cap, not dropping the event.
+ *  - 'format'     the model produced no parseable tagged answer within the cap.
+ * Infrastructure failures (HTTP 5xx, timeouts, rate limits) never reach here —
+ * the OpenRouter client retries them itself and throws if they persist.
+ */
+export type FailureKind = 'format' | 'truncated';
 
 export class Ledger5 {
   constructor(
@@ -122,16 +140,27 @@ export class Ledger5 {
   ) {}
 
   /**
-   * One logical call: send, parse; on parse failure re-send the IDENTICAL prompt once.
-   * Both attempts are recorded (attempt 1 flagged malformed if it failed). If the
-   * retry also fails, throws MalformedCallError; the caller drops the event.
+   * One logical call: send, parse; on parse failure re-send the IDENTICAL prompt
+   * and try again, up to `maxAttempts` times in total.
+   *
+   * D16 amendment (2026-08-26): the pre-registered rule is AT LEAST one retry
+   * (maxAttempts >= 2), not exactly one. Raising it is legitimate because a
+   * malformed call contains no parseable probability, so there is nothing to
+   * select on — retrying cannot be answer-shopping. Two properties keep that
+   * true and must not be broken:
+   *   1. the retry re-sends the IDENTICAL prompt (no corrective hint, which
+   *      would be a different prompt and would favour format-flaky models);
+   *   2. the decision to retry is mechanical (triggered by parse failure), never
+   *      taken by a human after inspecting the failed content.
+   * Every attempt is recorded, so the attempt distribution is auditable.
    */
   async call(
     llm: LLMClient,
     agentRole: string,
     prompt: SegmentedPrompt,
-    opts: { maxTokens?: number; temperature: number; round?: number },
+    opts: { maxTokens?: number; temperature: number; round?: number; maxAttempts?: number },
   ): Promise<LedgerCallResult> {
+    const maxAttempts = Math.max(2, opts.maxAttempts ?? 2);
     const req: GenerateRequest = {
       systemPrompt: renderSegments(prompt.system),
       userPrompt: renderSegments(prompt.user),
@@ -141,7 +170,7 @@ export class Ledger5 {
       metadata: { agentRole, configName: this.structure },
     };
     const attempts: CallLedgerRecord[] = [];
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const raw = await llm.generate(req);
       const extras = (raw as GenerateResponse & { extras?: ProviderExtras }).extras
         ?? { reasoningTokens: 0, reasoningText: '', content: raw.text };
@@ -160,8 +189,9 @@ export class Ledger5 {
         return { parsed, raw, record, fullVisible: visible.trim() };
       }
     }
+    const kinds = [...new Set(attempts.map(a => a.failureKind))].join('/');
     throw new MalformedCallError(
-      `${agentRole}: malformed after retry (${attempts.map(a => a.parseError).join(' | ')})`,
+      `${agentRole}: unusable after ${maxAttempts} attempts [${kinds}] (${attempts.map(a => a.parseError).join(' | ')})`,
       attempts,
     );
   }
@@ -206,10 +236,18 @@ export class Ledger5 {
       gapShare: visibleBudget > 0 ? (visibleBudget - visibleLocal) / visibleBudget : 0,
     };
 
+    // Failure taxonomy (D16 amendment): a cut-off answer is our cap being too
+    // low, not the model failing to comply — kept apart so the two are never
+    // conflated in the drop statistics.
+    const finishReason = extras.finishReason ?? null;
+    const failureKind: FailureKind | undefined = parsed
+      ? undefined
+      : (finishReason === 'length' ? 'truncated' : 'format');
+
     return {
       structure: this.structure, eventId: this.eventId, modelKey: this.modelKey,
       agentRole, round, attempt,
-      ok: !!parsed, malformed: !parsed, parseError,
+      ok: !!parsed, malformed: !parsed, parseError, failureKind, finishReason,
       read, write,
       totalTokens: raw.usage.totalTokens,
       costUsd: raw.costUsd ?? 0,
@@ -241,6 +279,10 @@ export interface StructureTotals {
   D: number; A: number; B: number; B_SELF: number; C1: number; C2: number; C2_hidden: number;
   prompt: number; completion: number; total: number; costUsd: number;
   calls: number; malformedAttempts: number; wastedTokens: number;
+  /** Failed attempts split by cause; only `format` is a genuine model failure. */
+  failFormat: number; failTruncated: number;
+  /** Successful calls that needed more than one attempt, and the max seen. */
+  retriedCalls: number; maxAttemptUsed: number;
   /** A + B + whole combiner call(s). B_SELF reported separately (open item). */
   commCost: number; commCostInclSelf: number;
   maxReadGap: number; maxWriteGap: number;
@@ -255,12 +297,20 @@ export interface StructureTotals {
 export function summarize(records: CallLedgerRecord[], combinerRoles: string[] = []): StructureTotals {
   const t: StructureTotals = {
     D: 0, A: 0, B: 0, B_SELF: 0, C1: 0, C2: 0, C2_hidden: 0, prompt: 0, completion: 0, total: 0, costUsd: 0,
-    calls: 0, malformedAttempts: 0, wastedTokens: 0, commCost: 0, commCostInclSelf: 0, maxReadGap: 0, maxWriteGap: 0,
+    calls: 0, malformedAttempts: 0, wastedTokens: 0, failFormat: 0, failTruncated: 0,
+    retriedCalls: 0, maxAttemptUsed: 0, commCost: 0, commCostInclSelf: 0, maxReadGap: 0, maxWriteGap: 0,
   };
   for (const r of records) {
     t.costUsd += r.costUsd;
-    if (r.malformed) { t.malformedAttempts++; t.wastedTokens += r.totalTokens; continue; }
+    if (r.malformed) {
+      t.malformedAttempts++;
+      t.wastedTokens += r.totalTokens;
+      if (r.failureKind === 'truncated') t.failTruncated++; else t.failFormat++;
+      continue;
+    }
     t.calls++;
+    t.maxAttemptUsed = Math.max(t.maxAttemptUsed, r.attempt);
+    if (r.attempt > 1) t.retriedCalls++;
     t.D += r.read.D; t.A += r.read.A; t.B += r.read.B; t.B_SELF += r.read.B_SELF;
     t.C1 += r.write.C1; t.C2 += r.write.C2; t.C2_hidden += r.write.C2_hidden;
     t.prompt += r.read.providerPrompt; t.completion += r.write.providerCompletion; t.total += r.totalTokens;

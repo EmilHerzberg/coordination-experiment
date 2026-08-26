@@ -20,6 +20,13 @@ export interface LadderParams {
   debateRounds: number;        // R revision rounds after round 0
   temperature: number;
   maxTokensPerCall?: number;
+  /**
+   * D16 amendment: pre-registered as AT LEAST one retry, i.e. >= 2 total attempts.
+   * Raising it is legitimate (a malformed call holds no probability, so there is
+   * nothing to select on) provided the retry stays identical and mechanical.
+   * Every attempt is logged, so the distribution is auditable.
+   */
+  maxParseAttempts?: number;
   /** [SESSION] formula for rung 1 and the debate's final round. Working doc says "averaged". */
   aggregate: 'mean' | 'median';
 }
@@ -101,7 +108,7 @@ export async function runLadder(
   const workerSettled = await Promise.allSettled(
     Array.from({ length: N }, (_, i) =>
       ledger.call(llm, `worker_${i + 1}`, workerPrompt(ev), {
-        maxTokens: p.maxTokensPerCall, temperature: p.temperature, round: 0,
+        maxTokens: p.maxTokensPerCall, temperature: p.temperature, maxAttempts: p.maxParseAttempts, round: 0,
       }),
     ),
   );
@@ -122,7 +129,7 @@ export async function runLadder(
     const sub = withStructure(ledger, 'aggregator');
     try {
       const r = await sub.call(llm, 'aggregator', aggregatorPrompt(ev, workers.map(w => w.parsed.reason)), {
-        maxTokens: p.maxTokensPerCall, temperature: p.temperature,
+        maxTokens: p.maxTokensPerCall, temperature: p.temperature, maxAttempts: p.maxParseAttempts,
       });
       outcomes.aggregator = { probability: r.parsed.probability, dropped: false };
     } catch (e) {
@@ -141,7 +148,7 @@ export async function runLadder(
           const peers = states.filter((_, j) => j !== i).map(s => ({ agentId: s.agentId, fullText: s.fullText }));
           return sub
             .call(llm, `debater_${own.agentId}`, debateRevisePrompt(ev, own, peers, round), {
-              maxTokens: p.maxTokensPerCall, temperature: p.temperature, round,
+              maxTokens: p.maxTokensPerCall, temperature: p.temperature, maxAttempts: p.maxParseAttempts, round,
             })
             .then(r => ({ agentId: own.agentId, fullText: r.fullVisible, probability: r.parsed.probability }));
         }),
