@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { summarize, type CallLedgerRecord, type StructureTotals } from './ledger5.js';
-import { structureRecords, STRUCTURES, COMBINER_ROLES, type StructureName } from './structures5.js';
+import { structureRecords, STRUCTURES, COMBINER_ROLES, spread, sd, type StructureName } from './structures5.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTDIR = resolve(HERE, '..', '..', 'pilot5');
@@ -17,7 +17,13 @@ function readJsonl<T>(p: string): T[] {
   return readFileSync(p, 'utf-8').split(/\r?\n/).filter(Boolean).map(l => JSON.parse(l) as T);
 }
 
-interface OutcomeLine { modelKey: string; eventId: string; outcomes: Record<StructureName, { probability: number | null; dropped: boolean; dropReason?: string }> }
+interface OutcomeLine {
+  modelKey: string;
+  eventId: string;
+  outcomes: Record<StructureName, { probability: number | null; dropped: boolean; dropReason?: string }>;
+  /** [round0(workers), round1, ...] — D14 spread/collapse diagnostic. */
+  roundProbabilities?: number[][];
+}
 
 export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]): string {
   const models = [...new Set(records.map(r => r.modelKey))];
@@ -77,6 +83,30 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   for (const o of outcomes) {
     const f = (s: StructureName) => o.outcomes[s].dropped ? `DROP (${o.outcomes[s].dropReason?.slice(0, 40)})` : o.outcomes[s].probability!.toFixed(2);
     L.push(`| ${o.modelKey} | ${o.eventId} | ${f('repetition')} | ${f('aggregator')} | ${f('debate')} |`);
+  }
+  L.push('');
+  L.push('## Agent spread per debate round (D14 diagnostic)');
+  L.push('');
+  L.push("_Round 0 = the shared workers. Spread = max minus min of the agents' probabilities in that round; SD in brackets. Two things to read here. (a) If round-0 spread is near zero, temperature 0.7 is not producing a real ensemble: averaging buys nothing and the debate has nothing to argue about. (b) If spread shrinks across rounds, the agents converged DESPITE the explicit instruction not to converge merely to converge (D11) — the stronger of the two possible findings._");
+  L.push('');
+  const withRounds = outcomes.filter(o => o.roundProbabilities && o.roundProbabilities.length);
+  if (!withRounds.length) {
+    L.push('no round data');
+  } else {
+    const maxR = Math.max(...withRounds.map(o => o.roundProbabilities!.length));
+    L.push('| model | events | ' + Array.from({ length: maxR }, (_, r) => `round ${r} spread (SD)`).join(' | ') + ' |');
+    L.push('|---|---:|' + Array.from({ length: maxR }, () => '---:').join('|') + '|');
+    for (const m of [...new Set(withRounds.map(o => o.modelKey))]) {
+      const mine = withRounds.filter(o => o.modelKey === m);
+      const cells: string[] = [];
+      for (let r = 0; r < maxR; r++) {
+        const vecs = mine.map(o => o.roundProbabilities![r]).filter(v => Array.isArray(v) && v.length > 0);
+        if (!vecs.length) { cells.push('n/a'); continue; }
+        const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+        cells.push(`${mean(vecs.map(spread)).toFixed(3)} (${mean(vecs.map(sd)).toFixed(3)})`);
+      }
+      L.push(`| ${m} | ${mine.length} | ${cells.join(' | ')} |`);
+    }
   }
   L.push('');
   L.push('## Malformed attempts');

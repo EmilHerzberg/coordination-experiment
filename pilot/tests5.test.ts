@@ -185,3 +185,42 @@ test('buildReport: sanity rows all ok on a clean mock run', async () => {
   assert.ok(md.includes('| mockA | repetition |'));
   assert.ok(md.includes('none'), 'no malformed attempts');
 });
+
+// ------------------------------------------- D14 spread / collapse diagnostic
+test('roundProbabilities capture per-round spread, and the report detects collapse', async () => {
+  const { buildReport } = await import('./make-report5.js');
+  const { spread, sd } = await import('./structures5.js');
+  assert.ok(Math.abs(spread([0.3, 0.5, 0.7]) - 0.4) < 1e-9);
+  assert.equal(spread([0.5, 0.5, 0.5]), 0);
+  assert.ok(sd([0.5, 0.5, 0.5]) === 0);
+
+  // Call order in runLadder: 3 workers, 1 aggregator, then 3 per debate round.
+  const seq = [0.30, 0.50, 0.70,   // round 0 workers  -> spread 0.40
+               0.55,               // aggregator
+               0.50, 0.51, 0.52,   // round 1          -> spread 0.02
+               0.50, 0.50, 0.51];  // round 2          -> spread 0.01
+  let i = 0;
+  const llm = mockClient(() => ({ content: good(seq[i++] ?? 0.5, 'reasoning text of adequate length here.') }));
+  const res = await runLadder(llm, EV, 'collapsy', { agentCount: 3, debateRounds: 2, temperature: 0.7, aggregate: 'mean' });
+
+  assert.equal(res.roundProbabilities.length, 3, 'round 0 + 2 revision rounds');
+  assert.deepEqual(res.roundProbabilities[0], [0.30, 0.50, 0.70]);
+  assert.ok(Math.abs(spread(res.roundProbabilities[0]) - 0.40) < 1e-9);
+  assert.ok(spread(res.roundProbabilities[1]) < 0.05, 'round 1 collapsed');
+  assert.ok(spread(res.roundProbabilities[2]) < spread(res.roundProbabilities[0]), 'collapse persists');
+
+  const md = buildReport(res.ledger.records, [
+    { modelKey: 'collapsy', eventId: EV.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities },
+  ]);
+  assert.ok(md.includes('Agent spread per debate round'), 'section present');
+  const row = md.split('\n').find(l => l.startsWith('| collapsy | 1 |'))!;
+  assert.ok(row, 'spread row present\n' + md);
+  assert.ok(row.includes('0.400'), 'round 0 spread shown: ' + row);
+  assert.ok(row.includes('0.020'), 'round 1 spread shown: ' + row);
+});
+
+test('a worker failure still returns a usable (empty) roundProbabilities', async () => {
+  const bad = mockClient(req => (req.metadata?.agentRole === 'worker_2' ? { content: 'nope' } : { content: good(0.5) }));
+  const r = await runLadder(bad, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  assert.deepEqual(r.roundProbabilities, []);
+});

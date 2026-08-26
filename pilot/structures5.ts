@@ -39,6 +39,31 @@ export interface EventRunResult {
   modelKey: string;
   outcomes: Record<StructureName, StructureOutcome>;
   ledger: Ledger5;
+  /**
+   * D14 diagnostic — the agents' probabilities per debate round.
+   * roundProbabilities[0] = the shared workers (round 0), [1] = after revision 1, …
+   *
+   * Two questions this answers, both decided in this session:
+   *  - B7/temperature: does temperature 0.7 produce a real ensemble at round 0,
+   *    or do all N workers land on the same number (then averaging buys nothing
+   *    and the debate has nothing to argue about)?
+   *  - D11/anti-convergence: does the spread SHRINK across rounds despite the
+   *    explicit instruction not to converge merely to converge? Collapse observed
+   *    against that instruction is the stronger of the two possible findings.
+   */
+  roundProbabilities: number[][];
+}
+
+/** Max-minus-min of a probability vector; 0 means the agents agree exactly. */
+export function spread(ps: number[]): number {
+  return ps.length ? Math.max(...ps) - Math.min(...ps) : 0;
+}
+
+/** Population standard deviation; reported next to the spread. */
+export function sd(ps: number[]): number {
+  if (ps.length < 2) return 0;
+  const m = ps.reduce((a, b) => a + b, 0) / ps.length;
+  return Math.sqrt(ps.reduce((a, b) => a + (b - m) ** 2, 0) / ps.length);
 }
 
 export function combine(ps: number[], how: 'mean' | 'median'): number {
@@ -69,6 +94,7 @@ export async function runLadder(
   const N = p.agentCount;
   const outcomes = {} as Record<StructureName, StructureOutcome>;
   const drop = (why: string): StructureOutcome => ({ probability: null, dropped: true, dropReason: why });
+  const roundProbabilities: number[][] = [];   // [round0(workers), round1, ...] — D14 diagnostic
 
   // ---- shared workers (rung 1 / rung 2 input / debate round 0)
   // allSettled: wait for ALL sibling calls so no record lands after we return.
@@ -82,9 +108,10 @@ export async function runLadder(
   const workerFail = firstFailure(workerSettled, 'worker');
   if (workerFail) {
     for (const s of STRUCTURES) outcomes[s] = drop(workerFail);
-    return { eventId: ev.id, modelKey, outcomes, ledger };
+    return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities };
   }
   const workers = workerSettled.map(r => (r as PromiseFulfilledResult<LedgerCallResult>).value);
+  roundProbabilities.push(workers.map(w => w.parsed.probability));   // round 0 = the shared workers
   outcomes.repetition = {
     probability: combine(workers.map(w => w.parsed.probability), p.aggregate),
     dropped: false,
@@ -120,14 +147,17 @@ export async function runLadder(
         }),
       );
       failed = firstFailure(settled, 'debate');
-      if (!failed) states = settled.map(r => (r as PromiseFulfilledResult<typeof states[number]>).value);
+      if (!failed) {
+        states = settled.map(r => (r as PromiseFulfilledResult<typeof states[number]>).value);
+        roundProbabilities.push(states.map(s => s.probability));
+      }
     }
     outcomes.debate = failed
       ? drop(failed)
       : { probability: combine(states.map(s => s.probability), p.aggregate), dropped: false };
   }
 
-  return { eventId: ev.id, modelKey, outcomes, ledger };
+  return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities };
 }
 
 function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): string | null {

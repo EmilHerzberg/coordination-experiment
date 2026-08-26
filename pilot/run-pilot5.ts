@@ -119,7 +119,7 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
       try {
         const res = await runLadder(client, ev, m.key, PARAMS);
         for (const r of res.ledger.records) appendFileSync(LEDGER_PATH, JSON.stringify(r) + '\n');
-        appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes }) + '\n');
+        appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities }) + '\n');
         const line = STRUCTURES.map(s => {
           const o = res.outcomes[s];
           const t = summarize(structureRecords(res.ledger.records, s), COMBINER_ROLES);
