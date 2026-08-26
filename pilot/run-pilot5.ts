@@ -9,15 +9,15 @@
 // output length per call. Use it before any paid run.
 //
 // Output dir: thesis/scaffold/pilot5/  (ledger5.jsonl, outcomes.jsonl, run_status.txt)
-import { appendFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OpenRouterClient, CostCapError, type ReasoningMode, type CostState } from './openrouter-client.js';
 import { getKey } from './env.js';
 import { EVIDENCE_BLOCKS } from './evidence.js';
 import { runLadder, structureRecords, STRUCTURES, COMBINER_ROLES, type LadderParams } from './structures5.js';
-import { summarize, localTokens, renderSegments } from './ledger5.js';
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts-draft.js';
+import { summarize, localTokens, renderSegments, measureTemplateOverhead } from './ledger5.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTDIR = resolve(HERE, '..', '..', 'pilot5');
@@ -26,6 +26,7 @@ const LEDGER_PATH = resolve(OUTDIR, 'ledger5.jsonl');
 const OUTCOMES_PATH = resolve(OUTDIR, 'outcomes.jsonl');
 const RAW_PATH = resolve(OUTDIR, 'runs_raw.jsonl');
 const STATUS_PATH = resolve(OUTDIR, 'run_status.txt');
+const OVERHEAD_PATH = resolve(OUTDIR, 'template_overhead.json');   // C2 / D18 calibration cache
 
 const MODE = (process.argv[2] ?? 'estimate').toLowerCase();
 const CAP_USD = Number(process.env.PILOT5_CAP_USD ?? '2.0');   // hard stop; confirm with the user before raising
@@ -54,7 +55,7 @@ export const PARAMS: LadderParams = {
   temperature: 0.7,
   maxTokensPerCall: 8000,   // r1 traces run 1.5-3k hidden tokens; leave headroom so truncation never causes "malformed"
   maxParseAttempts: 2,    // D16: pre-registered MINIMUM (1 retry); may be raised, every attempt logged
-  aggregate: 'mean',      // [SESSION] B5 still open
+  aggregate: 'mean',      // B5 CLOSED (D19): expose mandates averaging; Brier convexity guarantees mean >= typical individual
 };
 
 function status(line: string): void {
@@ -104,6 +105,9 @@ function estimate(): void {
 async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
   const apiKey = getKey();
   const cost: CostState = { spentUsd: 0, capUsd: CAP_USD };
+  const overheadCache: Record<string, number> = existsSync(OVERHEAD_PATH)
+    ? JSON.parse(readFileSync(OVERHEAD_PATH, 'utf-8'))
+    : {};
   writeFileSync(STATUS_PATH, `${MODE.toUpperCase()} start ${new Date().toISOString()} cap=$${CAP_USD}\n`);
   if (!existsSync(LEDGER_PATH) || MODE === 'full') { writeFileSync(LEDGER_PATH, ''); writeFileSync(OUTCOMES_PATH, ''); writeFileSync(RAW_PATH, ''); }
 
@@ -112,13 +116,31 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
       modelKey: m.key, modelSlug: m.slug, provider: m.provider, mode: m.mode,
       apiKey, logPath: RAW_PATH, cost,
     });
+    // C2 (D18): one minimal-prompt probe per model measures the FIXED chat-template
+    // overhead, which is then booked entirely to D instead of being smeared over A
+    // and B. Cached so a resumed run does not pay for it twice.
+    let overhead = overheadCache[m.key];
+    if (overhead === undefined) {
+      try {
+        const probe = await measureTemplateOverhead(client);
+        overhead = probe.overhead;
+        overheadCache[m.key] = overhead;
+        writeFileSync(OVERHEAD_PATH, JSON.stringify(overheadCache, null, 2));
+        status(`[calib] ${m.key}: template overhead ${overhead} tok/call (provider ${probe.providerPrompt} vs local ${probe.localCount})`);
+      } catch (e: any) {
+        overhead = 0;
+        status(`[calib] ${m.key}: probe FAILED (${e?.message}); falling back to purely proportional allocation`);
+      }
+    }
+    const params: LadderParams = { ...PARAMS, templateOverhead: overhead };
+
     const evs = (m.evidence === 'all' ? events : events.slice(0, 1)).slice(0, evLimit ?? undefined);
     for (const ev of evs) {
       if (cost.spentUsd >= CAP_USD) { status(`!! cost cap $${CAP_USD} reached; stopping`); break outer; }
       client.beginStructureRun('ladder', ev.id);
       const t0 = Date.now();
       try {
-        const res = await runLadder(client, ev, m.key, PARAMS);
+        const res = await runLadder(client, ev, m.key, params);
         for (const r of res.ledger.records) appendFileSync(LEDGER_PATH, JSON.stringify(r) + '\n');
         appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities }) + '\n');
         const line = STRUCTURES.map(s => {

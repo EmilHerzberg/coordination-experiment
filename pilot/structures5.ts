@@ -13,7 +13,7 @@
 
 import type { LLMClient } from '../src/types.js';
 import { Ledger5, MalformedCallError, type CallLedgerRecord, type LedgerCallResult } from './ledger5.js';
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts-draft.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts.js';
 
 export interface LadderParams {
   agentCount: number;          // N
@@ -27,7 +27,15 @@ export interface LadderParams {
    * Every attempt is logged, so the distribution is auditable.
    */
   maxParseAttempts?: number;
-  /** [SESSION] formula for rung 1 and the debate's final round. Working doc says "averaged". */
+  /** C2 (D18): the model's measured fixed chat-template overhead, booked to D. */
+  templateOverhead?: number;
+  /**
+   * B5 CLOSED 2026-08-26 (D19): 'mean'. The exposé commits to averaging, and the
+   * Brier score's convexity guarantees Brier(mean) <= mean(individual Briers),
+   * with the gap equal to the diversity the D14 spread diagnostic measures.
+   * The median (used by N&S and pilot v1) has no such guarantee and discards
+   * two of three values at N=3. Deviation from the scaffold study is deliberate.
+   */
   aggregate: 'mean' | 'median';
 }
 
@@ -97,7 +105,7 @@ export async function runLadder(
   modelKey: string,
   p: LadderParams,
 ): Promise<EventRunResult> {
-  const ledger = new Ledger5('workers', ev.id, modelKey);
+  const ledger = new Ledger5('workers', ev.id, modelKey, [], p.templateOverhead ?? 0);
   const N = p.agentCount;
   const outcomes = {} as Record<StructureName, StructureOutcome>;
   const drop = (why: string): StructureOutcome => ({ probability: null, dropped: true, dropReason: why });
@@ -179,5 +187,5 @@ function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): s
 
 /** A view on the same ledger that stamps a different structure name on new records. */
 function withStructure(base: Ledger5, structure: StructureName): Ledger5 {
-  return new Ledger5(structure, base.eventId, base.modelKey, base.records);
+  return new Ledger5(structure, base.eventId, base.modelKey, base.records, base.templateOverhead);
 }

@@ -2,7 +2,7 @@
 // local token counts. No network calls. Use it to audit the prompt design and
 // as the source for the thesis appendix.
 //   node --experimental-transform-types --import ./register.mjs show-prompts.ts [worker|aggregator|debate|all]
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts-draft.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts.js';
 import { localTokens, type SegmentedPrompt } from './ledger5.js';
 
 const EV: EvidencePack = { id: 'DEMO', text: '<<EVIDENCE BLOCK — the event\'s level-1 (or level-1+2) data goes here>>' };

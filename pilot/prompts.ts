@@ -1,7 +1,8 @@
 // =====================================================================
-//  PROMPTS — WORDING FROZEN 2026-08-26 (prompt session A1-A6, B1-B2).
-//  Every decision, with the reasoning on both sides and the rejected
-//  alternatives, is in ../../DECISIONS_PROMPT_SESSION.md (D1-D13).
+//  PROMPTS — FROZEN 2026-08-26. The prompt session is closed; every item of
+//  the agenda (A1-A6, B1-B8, C1-C4) is decided, and the reasoning on both
+//  sides plus the rejected alternatives is recorded in
+//  ../../DECISIONS_PROMPT_SESSION.md (D1-D19).
 //  Do not change wording here without adding a numbered entry there.
 //
 //  Everything a model READS lives in this one file, so wording can change

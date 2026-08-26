@@ -44,6 +44,33 @@ export function localTokens(text: string): number {
   return enc.encode(text, 'all').length;
 }
 
+/**
+ * Split one message's segments into token counts that sum EXACTLY to the token
+ * count of the concatenated message.
+ *
+ * Tokenizing each segment on its own and adding up over-counts, because a token
+ * may span a segment boundary and splitting forces an extra boundary there. The
+ * error is roughly one token per boundary, so it falls hardest on short, numerous
+ * segments — which is exactly what bucket A consists of (role headers such as
+ * "--- Analyst 2 ---"). Left uncorrected it inflates A, i.e. the communication
+ * cost RQ2 reports, in the same direction as the chat-template overhead did.
+ *
+ * Counting cumulative prefixes attributes each boundary token to the segment
+ * that completes it and makes the parts add up to the whole by construction.
+ */
+export function splitTokens(segs: Segment[]): number[] {
+  const out: number[] = [];
+  let acc = '';
+  let prev = 0;
+  for (const s of segs) {
+    acc += s.text;
+    const now = localTokens(acc);
+    out.push(Math.max(0, now - prev));
+    prev = now;
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ records
 export interface ReadSideCounts {
   D: number; A: number; B: number; B_SELF: number;
@@ -51,7 +78,18 @@ export interface ReadSideCounts {
   localSum: number;
   /** provider prompt_tokens. */
   providerPrompt: number;
-  /** (providerPrompt - localSum) / providerPrompt. Chat-template overhead + tokenizer mismatch. */
+  /**
+   * C2 (D18): the model's measured fixed chat-template overhead, assigned in
+   * FULL to D. A lone forecaster pays it too, so spreading it over A and B
+   * would inflate the communication cost that RQ2 reports.
+   */
+  templateOverhead: number;
+  /**
+   * Residual gap AFTER removing the fixed overhead, as a share of the provider
+   * count: (providerPrompt - overhead - localSum) / providerPrompt. This is the
+   * length-proportional tokenizer mismatch, and it alone is spread across the
+   * buckets in proportion to their local size.
+   */
   gapShare: number;
 }
 
@@ -137,6 +175,12 @@ export class Ledger5 {
     public readonly modelKey: string,
     /** Pass a shared array so several structure views write into one ledger. */
     public readonly records: CallLedgerRecord[] = [],
+    /**
+     * C2 (D18): this model's fixed per-call chat-template overhead in tokens,
+     * measured once by `measureTemplateOverhead`. Booked entirely to D.
+     * 0 falls back to the old purely proportional behaviour.
+     */
+    public readonly templateOverhead: number = 0,
   ) {}
 
   /**
@@ -202,20 +246,30 @@ export class Ledger5 {
     visible: string, parsed: TaggedOutput | null, parseError?: string,
   ): CallLedgerRecord {
     // ---- read side
+    // Prefix-based split PER MESSAGE: system and user are separate messages, so
+    // their boundary is a real one, but boundaries inside a message are ours and
+    // must not create phantom tokens (see splitTokens).
+    const sysTok = splitTokens(prompt.system);
+    const usrTok = splitTokens(prompt.user);
     const segs = [
-      ...prompt.system.map(s => ({ side: 'system' as const, ...s })),
-      ...prompt.user.map(s => ({ side: 'user' as const, ...s })),
-    ].map(s => ({ side: s.side, bucket: s.bucket, origin: s.origin, localTokens: localTokens(s.text) }));
+      ...prompt.system.map((s, i) => ({ side: 'system' as const, bucket: s.bucket, origin: s.origin, localTokens: sysTok[i] })),
+      ...prompt.user.map((s, i) => ({ side: 'user' as const, bucket: s.bucket, origin: s.origin, localTokens: usrTok[i] })),
+    ];
     const localByBucket: Record<ReadBucket, number> = { D: 0, A: 0, B: 0, B_SELF: 0 };
     for (const s of segs) localByBucket[s.bucket] += s.localTokens;
     const localSum = segs.reduce((a, s) => a + s.localTokens, 0);
     const providerPrompt = raw.usage.promptTokens;
-    const readScaled = rescale(localByBucket, localSum, providerPrompt);
+    // C2 (D18): peel off the fixed template overhead first and give it to D,
+    // then distribute only the length-proportional residual across the buckets.
+    const overhead = Math.max(0, Math.min(this.templateOverhead, providerPrompt));
+    const readScaled = rescale(localByBucket, localSum, providerPrompt - overhead);
+    readScaled.D += overhead;
     const read: ReadSideCounts = {
       ...readScaled,
       localSum,
       providerPrompt,
-      gapShare: providerPrompt > 0 ? (providerPrompt - localSum) / providerPrompt : 0,
+      templateOverhead: overhead,
+      gapShare: providerPrompt > 0 ? (providerPrompt - overhead - localSum) / providerPrompt : 0,
     };
 
     // ---- write side
@@ -258,6 +312,42 @@ export class Ledger5 {
       reasoningText: extras.reasoningText,
     };
   }
+}
+
+/**
+ * C2 (D18) — measure a model's FIXED per-call chat-template overhead.
+ *
+ * The provider wraps the messages in control markers (role delimiters, BOS and
+ * similar). Those are billed tokens that our local tokenizer never sees, and
+ * their number does not depend on how long the prompt is — a lone forecaster
+ * pays exactly the same amount as a debating one. Attributing them to D rather
+ * than smearing them over A and B removes a small but systematic upward bias on
+ * the communication cost that RQ2 reports.
+ *
+ * Method: send the shortest possible two-message prompt and subtract our local
+ * count from what the provider billed. One call per model, a fraction of a cent.
+ * Uses the same message shape (system + user) as every real call, which is what
+ * makes the measured constant transferable.
+ *
+ * The residual is floored at 0: a negative result would mean the model's own
+ * tokenizer is more compact than cl100k_base on this text, which is a
+ * proportional effect and belongs in the residual gap, not here.
+ */
+export async function measureTemplateOverhead(
+  llm: LLMClient,
+  probe: { system: string; user: string } = { system: 'a', user: 'b' },
+): Promise<{ overhead: number; providerPrompt: number; localCount: number }> {
+  const res = await llm.generate({
+    systemPrompt: probe.system,
+    userPrompt: probe.user,
+    tools: [],
+    maxTokens: 1,
+    temperature: 0,
+    metadata: { agentRole: 'calibration_probe', configName: 'calibration' },
+  });
+  const localCount = localTokens(probe.system) + localTokens(probe.user);
+  const providerPrompt = res.usage.promptTokens;
+  return { overhead: Math.max(0, providerPrompt - localCount), providerPrompt, localCount };
 }
 
 /** Largest-remainder rescale of integer parts so they sum EXACTLY to `target`. */

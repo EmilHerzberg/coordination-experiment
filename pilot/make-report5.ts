@@ -46,6 +46,19 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
     }
   }
   L.push('');
+  L.push('## Chat-template overhead (C2 / D18)');
+  L.push('');
+  L.push('_Fixed per-call tokens the provider bills that our local tokenizer never sees. Measured once per model with a minimal two-message probe and booked entirely to D, because a lone forecaster pays exactly the same amount. The residual column is the length-proportional tokenizer mismatch, which alone is spread across the buckets._');
+  L.push('');
+  L.push('| model | measured overhead (tok/call) | max residual gap |');
+  L.push('|---|---:|---:|');
+  for (const m of models) {
+    const mine = records.filter(r => r.modelKey === m && r.ok);
+    const oh = mine.length ? mine[0].read.templateOverhead : 0;
+    const maxRes = mine.reduce((a, r) => Math.max(a, Math.abs(r.read.gapShare)), 0);
+    L.push(`| ${m} | ${oh} | ${(maxRes * 100).toFixed(2)}% |`);
+  }
+  L.push('');
   L.push('## Sanity checks (NEXT_STEP_EXPLAINED.md §7)');
   L.push('');
   L.push('| model | repetition A=B=0 | aggregator B = Σ worker reasons (local) | debate B grows per round | identities hold on every call |');
@@ -57,8 +70,10 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
     // aggregator: its B should equal the local size of the reasons it was shown (segments origin worker:*:reason)
     const aggCalls = mine.filter(r => r.agentRole === 'aggregator');
     const aggOk = aggCalls.every(r => {
+      // Only the residual (providerPrompt - fixed overhead) is spread proportionally (C2/D18).
       const bLocal = r.segments.filter(s => s.bucket === 'B').reduce((a, s) => a + s.localTokens, 0);
-      return bLocal > 0 && Math.abs(r.read.B - bLocal * (r.read.providerPrompt / Math.max(r.read.localSum, 1))) <= 2;
+      const scale = (r.read.providerPrompt - r.read.templateOverhead) / Math.max(r.read.localSum, 1);
+      return bLocal > 0 && Math.abs(r.read.B - bLocal * scale) <= 2;
     });
     const rounds = [...new Set(mine.filter(r => r.structure === 'debate').map(r => r.round))].sort((a, b) => (a ?? 0) - (b ?? 0));
     const bByRound = rounds.map(rd => mine.filter(r => r.structure === 'debate' && r.round === rd).reduce((a, r) => a + r.read.B, 0));

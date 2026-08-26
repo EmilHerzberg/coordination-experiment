@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import type { GenerateRequest, GenerateResponse, LLMClient } from '../src/types.js';
 import { parseTagged, stripThink, TaggedParseError } from './tagged.js';
 import { Ledger5, localTokens, summarize, MalformedCallError, type ProviderExtras } from './ledger5.js';
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts-draft.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
 import { runLadder, structureRecords, COMBINER_ROLES } from './structures5.js';
 
 // ------------------------------------------------------------------ mock
@@ -269,4 +269,57 @@ test('failure taxonomy separates truncation from a genuine format failure', asyn
   const t2 = summarize(led2.records);
   assert.equal(t2.failFormat, 2);
   assert.equal(t2.failTruncated, 0);
+});
+
+// --------------------- C2 (D18): fixed template overhead is booked to D only
+test('template overhead goes entirely to D; identity still holds; A and B unaffected', async () => {
+  const OVERHEAD = 9;
+  // mock bills local tokens + OVERHEAD, exactly like a chat template would
+  const llm = mockClient(() => ({ content: good(0.5, 'peer reasoning text of some length here.') }), OVERHEAD);
+  const withOh = new Ledger5('debate', 'E1', 'mock', [], OVERHEAD);
+  const withoutOh = new Ledger5('debate', 'E1', 'mock', [], 0);
+  const own = { agentId: '1', fullText: good(0.4, 'my earlier reasoning') };
+  const peers = [{ agentId: '2', fullText: good(0.6, 'peer two reasoning') }];
+  const p = debateRevisePrompt(EV, own, peers, 1);
+
+  const a = (await withOh.call(llm, 'debater_1', p, { temperature: 0.7, round: 1 })).record;
+  const b = (await withoutOh.call(llm, 'debater_1', p, { temperature: 0.7, round: 1 })).record;
+
+  // identity holds in both cases
+  for (const r of [a, b]) {
+    assert.equal(r.read.D + r.read.A + r.read.B + r.read.B_SELF, r.read.providerPrompt);
+  }
+  assert.equal(a.read.templateOverhead, OVERHEAD);
+  assert.equal(b.read.templateOverhead, 0);
+  // the overhead lands in D, and A/B/B_SELF are NOT inflated by it
+  assert.ok(a.read.D > b.read.D, 'D absorbs the fixed overhead');
+  assert.ok(a.read.A <= b.read.A, 'A must not grow when overhead is attributed to D');
+  assert.ok(a.read.B <= b.read.B, 'B must not grow when overhead is attributed to D');
+  // and the residual gap is ~0 once the true overhead is removed
+  assert.ok(Math.abs(a.read.gapShare) < 1e-9, `residual should vanish, got ${a.read.gapShare}`);
+  assert.ok(b.read.gapShare > 0, 'without calibration the whole overhead shows up as gap');
+});
+
+test('measureTemplateOverhead recovers the mock template cost', async () => {
+  const { measureTemplateOverhead } = await import('./ledger5.js');
+  const llm = mockClient(() => ({ content: 'x' }), 11);
+  const r = await measureTemplateOverhead(llm);
+  assert.equal(r.overhead, 11);
+  assert.equal(r.providerPrompt - r.localCount, 11);
+});
+
+test('splitTokens sums exactly to the whole message and avoids boundary over-counting', async () => {
+  const { splitTokens, localTokens: lt } = await import('./ledger5.js');
+  const segs = [
+    { bucket: 'A' as const, text: '--- Analyst 2 ---\n', origin: 'h2' },
+    { bucket: 'B' as const, text: 'Backlog grew to $3.1B, up 7 % sequentially.', origin: 'p2' },
+    { bucket: 'A' as const, text: '\n\n', origin: 'sep' },
+    { bucket: 'A' as const, text: '--- Analyst 3 ---\n', origin: 'h3' },
+    { bucket: 'B' as const, text: 'Guidance assumes no improvement in Europe.', origin: 'p3' },
+  ];
+  const whole = segs.map(s => s.text).join('');
+  const parts = splitTokens(segs);
+  assert.equal(parts.reduce((a, b) => a + b, 0), lt(whole), 'parts must sum to the whole');
+  const naive = segs.reduce((a, s) => a + lt(s.text), 0);
+  assert.ok(naive >= lt(whole), 'per-segment tokenisation over-counts at boundaries');
 });
