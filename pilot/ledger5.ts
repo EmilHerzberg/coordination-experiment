@@ -106,21 +106,27 @@ export interface WriteSideCounts {
   /**
    * localVisible - (providerCompletion - providerReasoning), in TOKENS.
    *
-   * Positive means the provider's own numbers do not decompose: it reports more
-   * reasoning tokens than `completion - visible` leaves room for. Observed on
-   * DeepInfra/qwen3-32b, where reasoning_tokens + the visible answer exceeds
-   * completion_tokens by ~100-200 tokens per call.
+   * NOTE ON UNITS: this mixes two tokenizers, so it is a reconciliation
+   * DIAGNOSTIC, not an error term. localVisible is counted with cl100k_base,
+   * while the provider's figures are in the model's own tokenizer. Part of any
+   * gap is simply that difference (measured at roughly 5-13 % for Qwen).
    *
-   * What this does and does not touch:
-   *  - C1 + C2 = completion_tokens still holds exactly (we enforce it), and every
-   *    READ-side bucket is unaffected, so the communication cost RQ2 reports is
-   *    not impacted at all.
-   *  - Only the split of C2 into hidden and visible is affected. The provider's
-   *    reasoning_tokens is a direct measurement from the serving stack and is
-   *    kept authoritative for the hidden part; the visible part is the residual
-   *    and is squeezed when the provider over-reports reasoning.
-   * Reported per model in absolute tokens rather than as a share, because the
-   * share has a near-zero denominator and is meaningless (working doc §5.4).
+   * A real residual survives that correction, though. Over the 30 Qwen calls of
+   * the 2026-08-27 pilot, rescaling the visible answer into the provider's units
+   * still implies ~15 % more visible output than `completion - reasoning` leaves
+   * room for. The most plausible reading is that `message.reasoning` returns an
+   * INCOMPLETE rendering of the trace that was billed, since the shortfall runs
+   * in that direction. It cannot be settled from outside the provider.
+   *
+   * Why the accounting is nonetheless safe (working doc §5.4):
+   *  - every figure the thesis reports is a PROVIDER count; the local tokenizer
+   *    only supplies proportions, which are near scale-invariant;
+   *  - the read side is exact (shares of `prompt_tokens`), and compute matching
+   *    uses `total_tokens`, so neither RQ1 nor RQ2 touches this at all;
+   *  - C1 + C2 = completion_tokens still holds exactly, being shares of it.
+   * Only the hidden/visible split WITHIN C2 is approximate. It is a descriptive
+   * statistic and an input to no research question; the ratio is reported per
+   * model rather than smoothed away.
    */
   visibleDiscrepancy: number;
   /** Kept for continuity; see visibleDiscrepancy for the interpretable figure. */

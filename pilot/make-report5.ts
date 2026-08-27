@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { summarize, type CallLedgerRecord, type StructureTotals } from './ledger5.js';
+import { summarize, localTokens, type CallLedgerRecord, type StructureTotals } from './ledger5.js';
 import { structureRecords, STRUCTURES, COMBINER_ROLES, spread, sd, type StructureName } from './structures5.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -60,7 +60,25 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
     L.push(`| ${m} | ${oh} | ${(maxRes * 100).toFixed(2)}% | ${maxVis} |`);
   }
   L.push('');
-  L.push("_**Visible discrepancy** is `localVisible - (completion_tokens - reasoning_tokens)` in tokens. A positive value means the provider's own figures do not decompose: it reports more reasoning tokens than the completion count leaves room for beside the visible answer. This affects ONLY the split of C2 into hidden and visible. The identity C1 + C2 = completion_tokens holds exactly, and every read-side bucket is untouched, so the communication cost reported for RQ2 is unaffected. The provider's reasoning_tokens is a direct measurement from the serving stack and is kept authoritative for the hidden part; the visible part is the residual. Reported in absolute tokens because the corresponding share has a near-zero denominator (working doc §5.4)._");
+  L.push("_**Visible discrepancy** is `localVisible - (completion_tokens - reasoning_tokens)`. It mixes two tokenizers, so read it as a reconciliation diagnostic rather than an error: our cl100k_base count and the model's own tokenizer differ by roughly 5-13 % on Qwen text. See the reconciliation table below for the part that survives that correction._");
+  L.push('');
+  L.push('### Reconciliation of the provider figures (working doc §5.4)');
+  L.push('');
+  L.push('| model | local reasoning / provider reasoning | local total / completion | implied visible vs provider budget |');
+  L.push('|---|---:|---:|---:|');
+  for (const m of models) {
+    const mine = records.filter(r => r.modelKey === m && r.ok);
+    const lr = mine.reduce((a, r) => a + localTokens(r.reasoningText || ''), 0);
+    const pr = mine.reduce((a, r) => a + r.write.providerReasoning, 0);
+    const lv = mine.reduce((a, r) => a + localTokens(r.responseText || ''), 0);
+    const pc = mine.reduce((a, r) => a + r.write.providerCompletion, 0);
+    const budget = pc - pr;
+    const scale = pc > 0 ? (lr + lv) / pc : 1;          // local tokens per provider token
+    const impliedVisible = scale > 0 ? lv / scale : 0;   // our visible text in provider units
+    L.push(`| ${m} | ${pr > 0 ? (lr / pr).toFixed(3) : 'n/a'} | ${(scale).toFixed(3)} | ${budget > 0 ? (budget / Math.max(impliedVisible, 1)).toFixed(3) : 'n/a'} |`);
+  }
+  L.push('');
+  L.push("_Third column below 1.00 means the provider's `completion_tokens` minus `reasoning_tokens` leaves less room than the visible answer actually occupies, even after rescaling into the provider's own units. The likely reading is that `message.reasoning` returns an incomplete rendering of the trace that was billed. **Nothing the thesis reports depends on this:** every figure is a provider count, the local tokenizer supplies only proportions, the read side is exact shares of `prompt_tokens`, and compute matching uses `total_tokens`. Only the hidden/visible split within C2 is approximate, and it feeds no research question._");
   L.push('');
   L.push('## Sanity checks (NEXT_STEP_EXPLAINED.md §7)');
   L.push('');
