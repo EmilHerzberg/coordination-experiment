@@ -34,15 +34,15 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push(`Records: ${records.length} (ok ${records.filter(r => r.ok).length}, malformed attempts ${records.filter(r => r.malformed).length}). Total cost: $${records.reduce((a, r) => a + r.costUsd, 0).toFixed(4)}.`);
   L.push('');
-  L.push('| model | structure | calls | D | A | B | B_SELF | C1 | C2 (hidden) | total | **comm cost** | comm incl. self | malformed | wasted | max gap read/write | $ |');
-  L.push('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|');
+  L.push('| model | structure | calls | D | A | B | B_SELF | C1 | C2 (hidden) | total | **comm cost** | comm incl. self | malformed | wasted | read gap | visible discrep. (tok) | $ |');
+  L.push('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|');
   const perModelStruct = new Map<string, StructureTotals>();
   for (const m of models) {
     const mine = records.filter(r => r.modelKey === m);
     for (const s of STRUCTURES) {
       const t = summarize(structureRecords(mine, s), COMBINER_ROLES);
       perModelStruct.set(`${m}|${s}`, t);
-      L.push(`| ${m} | ${s} | ${t.calls} | ${t.D} | ${t.A} | ${t.B} | ${t.B_SELF} | ${t.C1} | ${t.C2} (${t.C2_hidden}) | ${t.total} | **${t.commCost}** | ${t.commCostInclSelf} | ${t.malformedAttempts} | ${t.wastedTokens} | ${(t.maxReadGap * 100).toFixed(1)}% / ${(t.maxWriteGap * 100).toFixed(1)}% | ${t.costUsd.toFixed(4)} |`);
+      L.push(`| ${m} | ${s} | ${t.calls} | ${t.D} | ${t.A} | ${t.B} | ${t.B_SELF} | ${t.C1} | ${t.C2} (${t.C2_hidden}) | ${t.total} | **${t.commCost}** | ${t.commCostInclSelf} | ${t.malformedAttempts} | ${t.wastedTokens} | ${(t.maxReadGap * 100).toFixed(1)}% | ${t.maxVisibleDiscrepancy} | ${t.costUsd.toFixed(4)} |`);
     }
   }
   L.push('');
@@ -50,14 +50,17 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push('_Fixed per-call tokens the provider bills that our local tokenizer never sees. Measured once per model with a minimal two-message probe and booked entirely to D, because a lone forecaster pays exactly the same amount. The residual column is the length-proportional tokenizer mismatch, which alone is spread across the buckets._');
   L.push('');
-  L.push('| model | measured overhead (tok/call) | max residual gap |');
-  L.push('|---|---:|---:|');
+  L.push('| model | measured overhead (tok/call) | max read residual | max visible discrepancy (tok) |');
+  L.push('|---|---:|---:|---:|');
   for (const m of models) {
     const mine = records.filter(r => r.modelKey === m && r.ok);
     const oh = mine.length ? mine[0].read.templateOverhead : 0;
     const maxRes = mine.reduce((a, r) => Math.max(a, Math.abs(r.read.gapShare)), 0);
-    L.push(`| ${m} | ${oh} | ${(maxRes * 100).toFixed(2)}% |`);
+    const maxVis = mine.reduce((a, r) => Math.max(a, Math.abs(r.write.visibleDiscrepancy ?? 0)), 0);
+    L.push(`| ${m} | ${oh} | ${(maxRes * 100).toFixed(2)}% | ${maxVis} |`);
   }
+  L.push('');
+  L.push("_**Visible discrepancy** is `localVisible - (completion_tokens - reasoning_tokens)` in tokens. A positive value means the provider's own figures do not decompose: it reports more reasoning tokens than the completion count leaves room for beside the visible answer. This affects ONLY the split of C2 into hidden and visible. The identity C1 + C2 = completion_tokens holds exactly, and every read-side bucket is untouched, so the communication cost reported for RQ2 is unaffected. The provider's reasoning_tokens is a direct measurement from the serving stack and is kept authoritative for the hidden part; the visible part is the residual. Reported in absolute tokens because the corresponding share has a near-zero denominator (working doc §5.4)._");
   L.push('');
   L.push('## Sanity checks (NEXT_STEP_EXPLAINED.md §7)');
   L.push('');

@@ -38,8 +38,30 @@ export class OpenRouterClient implements LLMClient {
       logPath: string;
       cost: CostState;
       retryPass?: boolean;
+      /**
+       * Minimum spacing between request STARTS for this model, in ms.
+       *
+       * The pilot run of 2026-08-26 lost 7 calls to upstream 429s on
+       * deepseek-chat-v3-0324: the ladder fires N workers (and later N debaters)
+       * concurrently, which is a burst against a shared, rate-limited endpoint.
+       * Spacing the starts converts a burst into a queue. 0 disables it.
+       */
+      minIntervalMs?: number;
+      /** Extra attempts allowed for 429 specifically (rate limits need patience). */
+      rateLimitAttempts?: number;
     },
   ) {}
+
+  /** Serialises request starts so concurrent sibling calls do not burst. */
+  private nextSlot = 0;
+  private async takeSlot(): Promise<void> {
+    const gap = this.opts.minIntervalMs ?? 0;
+    if (gap <= 0) return;
+    const now = Date.now();
+    const wait = Math.max(0, this.nextSlot - now);
+    this.nextSlot = Math.max(now, this.nextSlot) + gap;
+    if (wait > 0) await sleep(wait);
+  }
 
   /** Reset per-structure state so call_seq is meaningful within one structure run. */
   beginStructureRun(configName: string, evidenceId: string): void {
@@ -79,7 +101,14 @@ export class OpenRouterClient implements LLMClient {
     let data: any = null;
     let errText = '';
     let attempts = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let rateLimited = 0;
+    // 429s get their own, much more patient budget: a shared upstream endpoint
+    // may stay saturated for tens of seconds, and giving up after ~3s throws away
+    // an entire event (a failed worker drops all three rungs, D16).
+    const maxRateLimitAttempts = this.opts.rateLimitAttempts ?? 6;
+    const maxAttempts = 3 + maxRateLimitAttempts;
+    await this.takeSlot();
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       attempts = attempt + 1;
       try {
         const resp = await fetch(OPENROUTER_URL, {
@@ -98,7 +127,19 @@ export class OpenRouterClient implements LLMClient {
           break;
         }
         errText = await resp.text();
-        if (status === 429 || status >= 500) {
+        if (status === 429) {
+          rateLimited++;
+          if (rateLimited > maxRateLimitAttempts) break;
+          // Honour Retry-After when the provider sends it; otherwise back off
+          // exponentially from 2s (2, 4, 8, 16, 32, 60 capped).
+          const ra = Number(resp.headers.get('retry-after'));
+          const wait = Number.isFinite(ra) && ra > 0
+            ? Math.min(ra * 1000, 60000)
+            : Math.min(2000 * 2 ** (rateLimited - 1), 60000);
+          await sleep(wait);
+          continue;
+        }
+        if (status >= 500) {
           await sleep(700 * (attempt + 1) * (attempt + 1));
           continue;
         }

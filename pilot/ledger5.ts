@@ -101,7 +101,29 @@ export interface WriteSideCounts {
   C2_visible: number;
   providerCompletion: number;
   providerReasoning: number;
-  /** local count of visible text vs (completion - reasoning); share. */
+  /** Our local token count of the visible answer text. */
+  localVisible: number;
+  /**
+   * localVisible - (providerCompletion - providerReasoning), in TOKENS.
+   *
+   * Positive means the provider's own numbers do not decompose: it reports more
+   * reasoning tokens than `completion - visible` leaves room for. Observed on
+   * DeepInfra/qwen3-32b, where reasoning_tokens + the visible answer exceeds
+   * completion_tokens by ~100-200 tokens per call.
+   *
+   * What this does and does not touch:
+   *  - C1 + C2 = completion_tokens still holds exactly (we enforce it), and every
+   *    READ-side bucket is unaffected, so the communication cost RQ2 reports is
+   *    not impacted at all.
+   *  - Only the split of C2 into hidden and visible is affected. The provider's
+   *    reasoning_tokens is a direct measurement from the serving stack and is
+   *    kept authoritative for the hidden part; the visible part is the residual
+   *    and is squeezed when the provider over-reports reasoning.
+   * Reported per model in absolute tokens rather than as a share, because the
+   * share has a near-zero denominator and is meaningless (working doc §5.4).
+   */
+  visibleDiscrepancy: number;
+  /** Kept for continuity; see visibleDiscrepancy for the interpretable figure. */
   gapShare: number;
 }
 
@@ -287,6 +309,8 @@ export class Ledger5 {
       C2_visible: w.C2v,
       providerCompletion,
       providerReasoning,
+      localVisible: visibleLocal,
+      visibleDiscrepancy: visibleLocal - visibleBudget,
       gapShare: visibleBudget > 0 ? (visibleBudget - visibleLocal) / visibleBudget : 0,
     };
 
@@ -373,6 +397,8 @@ export interface StructureTotals {
   failFormat: number; failTruncated: number;
   /** Successful calls that needed more than one attempt, and the max seen. */
   retriedCalls: number; maxAttemptUsed: number;
+  /** Worst |localVisible - (completion - reasoning)| in tokens; see visibleDiscrepancy. */
+  maxVisibleDiscrepancy: number;
   /** A + B + whole combiner call(s). B_SELF reported separately (open item). */
   commCost: number; commCostInclSelf: number;
   maxReadGap: number; maxWriteGap: number;
@@ -388,7 +414,8 @@ export function summarize(records: CallLedgerRecord[], combinerRoles: string[] =
   const t: StructureTotals = {
     D: 0, A: 0, B: 0, B_SELF: 0, C1: 0, C2: 0, C2_hidden: 0, prompt: 0, completion: 0, total: 0, costUsd: 0,
     calls: 0, malformedAttempts: 0, wastedTokens: 0, failFormat: 0, failTruncated: 0,
-    retriedCalls: 0, maxAttemptUsed: 0, commCost: 0, commCostInclSelf: 0, maxReadGap: 0, maxWriteGap: 0,
+    retriedCalls: 0, maxAttemptUsed: 0, maxVisibleDiscrepancy: 0,
+    commCost: 0, commCostInclSelf: 0, maxReadGap: 0, maxWriteGap: 0,
   };
   for (const r of records) {
     t.costUsd += r.costUsd;
@@ -406,6 +433,7 @@ export function summarize(records: CallLedgerRecord[], combinerRoles: string[] =
     t.prompt += r.read.providerPrompt; t.completion += r.write.providerCompletion; t.total += r.totalTokens;
     t.maxReadGap = Math.max(t.maxReadGap, Math.abs(r.read.gapShare));
     t.maxWriteGap = Math.max(t.maxWriteGap, Math.abs(r.write.gapShare));
+    t.maxVisibleDiscrepancy = Math.max(t.maxVisibleDiscrepancy, Math.abs(r.write.visibleDiscrepancy ?? 0));
     const isCombiner = combinerRoles.includes(r.agentRole);
     const own = isCombiner ? r.totalTokens : r.read.A + r.read.B;
     t.commCost += own;

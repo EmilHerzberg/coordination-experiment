@@ -37,6 +37,8 @@ interface ModelSpec {
   evidence: 'all' | 'first';
   /** $/M tokens in → out, from models_verified.md (2026-07-24). */
   priceIn: number; priceOut: number;
+  /** Minimum spacing between request starts (ms). See the 429 note on MODELS. */
+  minIntervalMs?: number;
 }
 
 // EXPERIMENT ROSTER — decided 2026-08-26 (D20). Two open-weight families, one
@@ -53,7 +55,10 @@ interface ModelSpec {
 // Prices here are for the offline estimate only; real cost comes from usage.cost.
 export const MODELS: ModelSpec[] = [
   { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28 },
-  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324', provider: 'DeepInfra', mode: 'none',      arm: 'non-reasoning', evidence: 'all', priceIn: 0.24, priceOut: 0.90 },
+  // minIntervalMs: the 2026-08-26 pilot lost 7 calls to upstream 429s on this
+  // model — the ladder bursts N concurrent workers at a shared, rate-limited
+  // endpoint. Spacing the starts turns the burst into a queue.
+  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324', provider: 'DeepInfra', mode: 'none',      arm: 'non-reasoning', evidence: 'all', priceIn: 0.24, priceOut: 0.90, minIntervalMs: 3000 },
 ];
 
 /**
@@ -139,7 +144,7 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
   outer: for (const m of MODELS.filter(m => modelKeys.includes(m.key))) {
     const client = new OpenRouterClient({
       modelKey: m.key, modelSlug: m.slug, provider: m.provider, mode: m.mode,
-      apiKey, logPath: RAW_PATH, cost,
+      apiKey, logPath: RAW_PATH, cost, minIntervalMs: m.minIntervalMs ?? 0,
     });
     // C2 (D18): one minimal-prompt probe per model measures the FIXED chat-template
     // overhead, which is then booked entirely to D instead of being smeared over A
