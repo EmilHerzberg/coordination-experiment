@@ -12,7 +12,7 @@
 import { appendFileSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OpenRouterClient, CostCapError, type ReasoningMode, type CostState } from './openrouter-client.js';
+import { OpenRouterClient, CostCapError, Throttle, type ReasoningMode, type CostState } from './openrouter-client.js';
 import { getKey } from './env.js';
 import { EVIDENCE_BLOCKS } from './evidence.js';
 import { runLadder, structureRecords, STRUCTURES, COMBINER_ROLES, type LadderParams } from './structures5.js';
@@ -30,6 +30,10 @@ const OVERHEAD_PATH = resolve(OUTDIR, 'template_overhead.json');   // C2 / D18 c
 
 const MODE = (process.argv[2] ?? 'estimate').toLowerCase();
 const CAP_USD = Number(process.env.PILOT5_CAP_USD ?? '2.0');   // hard stop; confirm with the user before raising
+// Event-level parallelism. Each (model, event) pair is an independent ladder run,
+// so they can proceed concurrently; the per-model Throttle keeps the request rate
+// safe. Wall-clock, not money, is the binding constraint on the real run.
+const CONCURRENCY = Number(process.env.PILOT5_CONCURRENCY ?? '6');
 
 interface ModelSpec {
   key: string; slug: string; provider: string; mode: ReasoningMode;
@@ -54,7 +58,7 @@ interface ModelSpec {
 //
 // Prices here are for the offline estimate only; real cost comes from usage.cost.
 export const MODELS: ModelSpec[] = [
-  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28 },
+  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 300 },
   // minIntervalMs: the 2026-08-26 pilot lost 7 calls to upstream 429s on this
   // model — the ladder bursts N concurrent workers at a shared, rate-limited
   // endpoint. Spacing the starts turns the burst into a queue.
@@ -141,18 +145,26 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
   writeFileSync(STATUS_PATH, `${MODE.toUpperCase()} start ${new Date().toISOString()} cap=$${CAP_USD}\n`);
   if (!existsSync(LEDGER_PATH) || MODE === 'full') { writeFileSync(LEDGER_PATH, ''); writeFileSync(OUTCOMES_PATH, ''); writeFileSync(RAW_PATH, ''); }
 
-  outer: for (const m of MODELS.filter(m => modelKeys.includes(m.key))) {
-    const client = new OpenRouterClient({
-      modelKey: m.key, modelSlug: m.slug, provider: m.provider, mode: m.mode,
-      apiKey, logPath: RAW_PATH, cost, minIntervalMs: m.minIntervalMs ?? 0,
-    });
-    // C2 (D18): one minimal-prompt probe per model measures the FIXED chat-template
-    // overhead, which is then booked entirely to D instead of being smeared over A
-    // and B. Cached so a resumed run does not pay for it twice.
+  const roster = MODELS.filter(m => modelKeys.includes(m.key));
+
+  // ---- one shared throttle per MODEL. Concurrent events each get their own
+  // client (so per-event logging stays correct) but must share the rate limit,
+  // or six parallel events would each get their own budget and burst again.
+  const throttles = new Map<string, Throttle>(
+    roster.map(m => [m.key, new Throttle(m.minIntervalMs ?? 0)]),
+  );
+  const mkClient = (m: ModelSpec) => new OpenRouterClient({
+    modelKey: m.key, modelSlug: m.slug, provider: m.provider, mode: m.mode,
+    apiKey, logPath: RAW_PATH, cost, throttle: throttles.get(m.key),
+  });
+
+  // ---- calibration first, sequentially: one cheap probe per model (D18).
+  const paramsByModel = new Map<string, LadderParams>();
+  for (const m of roster) {
     let overhead = overheadCache[m.key];
     if (overhead === undefined) {
       try {
-        const probe = await measureTemplateOverhead(client);
+        const probe = await measureTemplateOverhead(mkClient(m));
         overhead = probe.overhead;
         overheadCache[m.key] = overhead;
         writeFileSync(OVERHEAD_PATH, JSON.stringify(overheadCache, null, 2));
@@ -162,30 +174,61 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
         status(`[calib] ${m.key}: probe FAILED (${e?.message}); falling back to purely proportional allocation`);
       }
     }
-    const params: LadderParams = { ...PARAMS, templateOverhead: overhead };
-
-    const evs = (m.evidence === 'all' ? events : events.slice(0, 1)).slice(0, evLimit ?? undefined);
-    for (const ev of evs) {
-      if (cost.spentUsd >= CAP_USD) { status(`!! cost cap $${CAP_USD} reached; stopping`); break outer; }
-      client.beginStructureRun('ladder', ev.id);
-      const t0 = Date.now();
-      try {
-        const res = await runLadder(client, ev, m.key, params);
-        for (const r of res.ledger.records) appendFileSync(LEDGER_PATH, JSON.stringify(r) + '\n');
-        appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities }) + '\n');
-        const line = STRUCTURES.map(s => {
-          const o = res.outcomes[s];
-          const t = summarize(structureRecords(res.ledger.records, s), COMBINER_ROLES);
-          return `${s}=${o.dropped ? 'DROP' : o.probability!.toFixed(2)}(comm ${t.commCost})`;
-        }).join(' ');
-        status(`[${MODE}] ${m.key} | ${ev.id} | ${line} | ${((Date.now() - t0) / 1000).toFixed(0)}s | $${cost.spentUsd.toFixed(4)}`);
-      } catch (e: any) {
-        if (e instanceof CostCapError) { status(`!! ${e.message}`); break outer; }
-        status(`[${MODE}] ${m.key} | ${ev.id} | FAIL ${e?.message}`);
-      }
-    }
+    paramsByModel.set(m.key, { ...PARAMS, templateOverhead: overhead });
   }
-  status(`${MODE.toUpperCase()} done. total=$${cost.spentUsd.toFixed(4)}`);
+
+  // ---- the work list: every (model, event) pair is an independent ladder run.
+  const tasks = roster.flatMap(m =>
+    (m.evidence === 'all' ? events : events.slice(0, 1))
+      .slice(0, evLimit ?? undefined)
+      .map(ev => ({ m, ev })),
+  );
+  status(`${tasks.length} ladder runs over ${roster.length} models, concurrency ${CONCURRENCY}`);
+
+  let done = 0, dropped = 0, aborted = false;
+  await pool(tasks, CONCURRENCY, async ({ m, ev }) => {
+    if (aborted) return;
+    if (cost.spentUsd >= CAP_USD) {
+      if (!aborted) { aborted = true; status(`!! cost cap $${CAP_USD} reached; stopping`); }
+      return;
+    }
+    // Fresh client per task: beginStructureRun sets per-run logging state, which
+    // concurrent tasks would otherwise clobber. The throttle is still shared.
+    const client = mkClient(m);
+    client.beginStructureRun('ladder', ev.id);
+    const t0 = Date.now();
+    try {
+      const res = await runLadder(client, ev, m.key, paramsByModel.get(m.key)!);
+      // appendFileSync is synchronous, so concurrent writers cannot interleave a line.
+      for (const r of res.ledger.records) appendFileSync(LEDGER_PATH, JSON.stringify(r) + '\n');
+      appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities }) + '\n');
+      const line = STRUCTURES.map(s => {
+        const o = res.outcomes[s];
+        const t = summarize(structureRecords(res.ledger.records, s), COMBINER_ROLES);
+        if (o.dropped) dropped++;
+        return `${s}=${o.dropped ? 'DROP' : o.probability!.toFixed(2)}(comm ${t.commCost})`;
+      }).join(' ');
+      done++;
+      status(`[${MODE}] (${done}/${tasks.length}) ${m.key} | ${ev.id} | ${line} | ${((Date.now() - t0) / 1000).toFixed(0)}s | $${cost.spentUsd.toFixed(4)}`);
+    } catch (e: any) {
+      if (e instanceof CostCapError) { aborted = true; status(`!! ${e.message}`); return; }
+      status(`[${MODE}] ${m.key} | ${ev.id} | FAIL ${e?.message}`);
+    }
+  });
+  status(`${MODE.toUpperCase()} done. ${done}/${tasks.length} ladder runs, ${dropped} structure drops, total=$${cost.spentUsd.toFixed(4)}`);
+}
+
+/** Run `fn` over `items` with at most `limit` in flight. */
+async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
 }
 
 async function main(): Promise<void> {

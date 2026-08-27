@@ -16,6 +16,27 @@ export interface CostState {
 
 export class CostCapError extends Error {}
 
+/**
+ * Spaces request STARTS for one model, across every caller that shares it.
+ *
+ * With event-level parallelism several ladder runs use the same model at the
+ * same time. Each holds its own client (so per-event logging stays correct), so
+ * the rate limit has to live OUTSIDE the client — otherwise six parallel events
+ * would each get their own budget and we would be bursting again, which is what
+ * lost 7 calls to upstream 429s on 2026-08-26.
+ */
+export class Throttle {
+  private nextSlot = 0;
+  constructor(public readonly minIntervalMs: number) {}
+  async take(): Promise<void> {
+    if (this.minIntervalMs <= 0) return;
+    const now = Date.now();
+    const wait = Math.max(0, this.nextSlot - now);
+    this.nextSlot = Math.max(now, this.nextSlot) + this.minIntervalMs;
+    if (wait > 0) await sleep(wait);
+  }
+}
+
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 function sleep(ms: number): Promise<void> {
@@ -47,20 +68,22 @@ export class OpenRouterClient implements LLMClient {
        * Spacing the starts converts a burst into a queue. 0 disables it.
        */
       minIntervalMs?: number;
+      /**
+       * Shared per-MODEL throttle. Preferred over minIntervalMs whenever several
+       * clients run concurrently (event-level parallelism), because the limit has
+       * to be global per model, not per client.
+       */
+      throttle?: Throttle;
       /** Extra attempts allowed for 429 specifically (rate limits need patience). */
       rateLimitAttempts?: number;
     },
-  ) {}
+  ) {
+    this.ownThrottle = opts.throttle ?? new Throttle(opts.minIntervalMs ?? 0);
+  }
 
-  /** Serialises request starts so concurrent sibling calls do not burst. */
-  private nextSlot = 0;
+  private readonly ownThrottle: Throttle;
   private async takeSlot(): Promise<void> {
-    const gap = this.opts.minIntervalMs ?? 0;
-    if (gap <= 0) return;
-    const now = Date.now();
-    const wait = Math.max(0, this.nextSlot - now);
-    this.nextSlot = Math.max(now, this.nextSlot) + gap;
-    if (wait > 0) await sleep(wait);
+    await this.ownThrottle.take();
   }
 
   /** Reset per-structure state so call_seq is meaningful within one structure run. */
