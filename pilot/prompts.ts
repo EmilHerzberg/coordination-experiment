@@ -126,7 +126,7 @@ export function aggregatorPrompt(ev: EvidencePack, workerReasons: string[]): Seg
   }
   user.push(seg('A', 'The analysts\' reasoning sections:\n\n', 'agg_frame'));
   workerReasons.forEach((r, i) => {
-    user.push(seg('A', `--- Analyst ${i + 1} ---\n`, `agg_header:${i + 1}`));
+    user.push(seg('A', `Analyst ${i + 1} wrote:\n`, `agg_header:${i + 1}`));
     user.push(seg('B', r.trim(), `worker:${i + 1}:reason`));
     user.push(seg('A', '\n\n', 'sep'));
   });
@@ -144,7 +144,14 @@ export function aggregatorPrompt(ev: EvidencePack, workerReasons: string[]): Seg
 /** Rung 3 debate revision: base + revise role (A), evidence (D), peers' full answers (B), own prior (B_SELF).
  *  A6 CLOSED 2026-08-26 (D13): navigation headers kept as drafted, including the
  *  round number — the TOTAL round count is never revealed, so it carries no
- *  strategic signal about being near the end. */
+ *  strategic signal about being near the end.
+ *
+ *  AMENDED 2026-08-27 (D21): peer headers changed from "--- Analyst N ---" to the
+ *  prose form "Analyst N wrote:", in both the aggregator and the debate prompt.
+ *  A DeepSeek aggregator once answered in "--- reasoning --- / --- numeric ---"
+ *  sections, i.e. it appeared to imitate the delimiter style of its own input.
+ *  The failure did NOT reproduce on a re-run of the identical call, so this is a
+ *  cheap precaution against a plausible-but-unconfirmed cause, not a proven fix. */
 export function debateRevisePrompt(
   ev: EvidencePack,
   own: { agentId: string; fullText: string },
@@ -157,7 +164,7 @@ export function debateRevisePrompt(
     seg('A', `\n\nRound ${round}. Other analysts' answers:\n\n`, 'debate_frame'),
   ];
   for (const p of peers) {
-    user.push(seg('A', `--- Analyst ${p.agentId} ---\n`, `peer_header:${p.agentId}`));
+    user.push(seg('A', `Analyst ${p.agentId} wrote:\n`, `peer_header:${p.agentId}`));
     user.push(seg('B', p.fullText.trim(), `peer:${p.agentId}:round${round - 1}`));
     user.push(seg('A', '\n\n', 'sep'));
   }

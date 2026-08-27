@@ -34,6 +34,8 @@ const CAP_USD = Number(process.env.PILOT5_CAP_USD ?? '2.0');   // hard stop; con
 // so they can proceed concurrently; the per-model Throttle keeps the request rate
 // safe. Wall-clock, not money, is the binding constraint on the real run.
 const CONCURRENCY = Number(process.env.PILOT5_CONCURRENCY ?? '6');
+// Repeat the whole event set N times, to get sample size on rare failures.
+const REPEATS = Math.max(1, Number(process.env.PILOT5_REPEATS ?? '1'));
 
 interface ModelSpec {
   key: string; slug: string; provider: string; mode: ReasoningMode;
@@ -178,10 +180,16 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
   }
 
   // ---- the work list: every (model, event) pair is an independent ladder run.
+  // PILOT5_REPEATS repeats the whole event set. Format failures are rare (the one
+  // observed was 1 in 6 aggregator calls and did not reproduce), so a single pass
+  // over three events cannot distinguish a fixed prompt from a lucky draw.
+  // Repeats buy sample size cheaply; repeated events carry an "#rN" id suffix.
   const tasks = roster.flatMap(m =>
-    (m.evidence === 'all' ? events : events.slice(0, 1))
-      .slice(0, evLimit ?? undefined)
-      .map(ev => ({ m, ev })),
+    Array.from({ length: REPEATS }, (_, rep) =>
+      (m.evidence === 'all' ? events : events.slice(0, 1))
+        .slice(0, evLimit ?? undefined)
+        .map(ev => ({ m, ev: rep === 0 ? ev : { ...ev, id: `${ev.id}#r${rep + 1}` } })),
+    ).flat(),
   );
   status(`${tasks.length} ladder runs over ${roster.length} models, concurrency ${CONCURRENCY}`);
 
