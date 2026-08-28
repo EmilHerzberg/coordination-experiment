@@ -243,17 +243,37 @@ export async function runLadder(
       const sub = withStructure(ledger, 'repetition');
       let spent = workerTokens;
       let guard = 0;
-      while (spent < ceiling && guard++ < MAX_EXTRA_RUNS) {
-        try {
-          const r = await sub.call(llm, `rep_${repetitionRuns.length + 1}`, workerPrompt(ev), {
-            maxTokens: p.maxTokensPerCall, temperature: p.temperature,
-            maxAttempts: p.maxParseAttempts, round: 0,
-          });
-          repetitionRuns.push({ probability: r.parsed.probability, totalTokens: r.record.totalTokens });
-          spent += r.record.totalTokens;
-        } catch {
-          break;   // a malformed extra run stops the draw; the shortfall is reported
+      const drawOne = (i: number) =>
+        sub.call(llm, `rep_${i}`, workerPrompt(ev), {
+          maxTokens: p.maxTokensPerCall, temperature: p.temperature,
+          maxAttempts: p.maxParseAttempts, round: 0,
+        });
+
+      // Draw in BATCHES rather than one at a time. The runs are independent, so
+      // serialising them was pure latency: 13-16 sequential calls took 370-760s
+      // per ladder against 165s for the rest of it. The batch size is estimated
+      // from the average cost of the runs already drawn, then topped up if the
+      // estimate fell short. Overshoot is harmless — a run beyond the ceiling is
+      // simply never used by any prefix, since every prefix must FIT its budget.
+      while (spent < ceiling && guard < MAX_EXTRA_RUNS) {
+        const avgRun = repetitionRuns.reduce((a, r) => a + r.totalTokens, 0) / repetitionRuns.length;
+        const need = Math.max(1, Math.min(
+          Math.ceil((ceiling - spent) / Math.max(avgRun, 1)),
+          MAX_EXTRA_RUNS - guard,
+          MAX_BATCH,
+        ));
+        const settled = await Promise.allSettled(
+          Array.from({ length: need }, (_, k) => drawOne(repetitionRuns.length + k + 1)),
+        );
+        guard += need;
+        let anyOk = false;
+        for (const r of settled) {
+          if (r.status !== 'fulfilled') continue;   // malformed extra run: skip it
+          anyOk = true;
+          repetitionRuns.push({ probability: r.value.parsed.probability, totalTokens: r.value.record.totalTokens });
+          spent += r.value.record.totalTokens;
         }
+        if (!anyOk) break;   // nothing usable came back; report the shortfall
       }
 
       for (const [s, budget] of budgets) {
@@ -283,6 +303,11 @@ export async function runLadder(
 
 /** Safety stop on the matching draw, so a cheap-run/expensive-structure ratio cannot loop away. */
 const MAX_EXTRA_RUNS = 200;
+/**
+ * Cap on one parallel batch of matching draws. Keeps the burst bounded so the
+ * per-model throttle stays the thing that governs request rate, not this.
+ */
+const MAX_BATCH = 8;
 
 function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): string | null {
   for (const r of settled) {
