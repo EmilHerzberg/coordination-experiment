@@ -87,8 +87,8 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push('## Sanity checks (NEXT_STEP_EXPLAINED.md §7)');
   L.push('');
-  L.push('| model | repetition A=B=0 | aggregator B = Σ worker reasons (local) | debate B grows per round | identities hold on every call |');
-  L.push('|---|---|---|---|---|');
+  L.push('| model | repetition A=B=0 | aggregator B = Σ worker reasons (local) | debate B grows per round | identities hold on every call | independent samples |');
+  L.push('|---|---|---|---|---|---|');
   for (const m of models) {
     const mine = records.filter(r => r.modelKey === m && r.ok);
     const rep = perModelStruct.get(`${m}|repetition`)!;
@@ -105,7 +105,22 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
     const bByRound = rounds.map(rd => mine.filter(r => r.structure === 'debate' && r.round === rd).reduce((a, r) => a + r.read.B, 0));
     const debOk = bByRound.every(b => b > 0);
     const idOk = mine.every(r => r.read.D + r.read.A + r.read.B + r.read.B_SELF === r.read.providerPrompt && r.write.C1 + r.write.C2 === r.write.providerCompletion);
-    L.push(`| ${m} | ${repOk ? 'ok' : 'FAIL'} | ${aggCalls.length ? (aggOk ? 'ok' : 'FAIL') : 'n/a'} | ${bByRound.length ? bByRound.join(' → ') : 'n/a'} ${debOk ? '' : 'FAIL'} | ${idOk ? 'ok' : 'FAIL'} |`);
+    // D24: the communication-free rung IS independent repeated sampling, so two
+    // identical answers to an identical prompt at temperature > 0 mean the host
+    // is collapsing concurrent requests. DeepInfra did exactly that for DeepSeek
+    // V3 (6 responses, 2 distinct). Checked per event over the workers and the
+    // matching draws, which all share one prompt.
+    let dupWorst = '';
+    for (const ev of [...new Set(mine.map(r => r.eventId))]) {
+      const sameprompt = mine.filter(r => r.eventId === ev &&
+        (r.agentRole.startsWith('worker_') || r.agentRole.startsWith('rep_')));
+      const distinct = new Set(sameprompt.map(r => r.responseText.trim())).size;
+      if (sameprompt.length > 1 && distinct < sameprompt.length) {
+        dupWorst = `FAIL ${ev}: ${distinct}/${sameprompt.length} distinct`;
+        break;
+      }
+    }
+    L.push(`| ${m} | ${repOk ? 'ok' : 'FAIL'} | ${aggCalls.length ? (aggOk ? 'ok' : 'FAIL') : 'n/a'} | ${bByRound.length ? bByRound.join(' → ') : 'n/a'} ${debOk ? '' : 'FAIL'} | ${idOk ? 'ok' : 'FAIL'} | ${dupWorst || 'ok'} |`);
   }
   L.push('');
   L.push('## Communication cost, absolute tokens (the number compute-matching needs)');

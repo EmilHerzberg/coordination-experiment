@@ -429,3 +429,35 @@ test('compute matching: a dropped structure gets no comparison', async () => {
   assert.ok(!res.matched.some(m => m.structure === 'aggregator'), 'no matched comparison for a dropped structure');
   assert.ok(res.matched.some(m => m.structure === 'debate'), 'the surviving structure still gets one');
 });
+
+/** The row from the SANITY CHECKS table — several tables start with the model name. */
+function sanityRow(md: string, model: string): string {
+  const lines = md.split('\n');
+  const start = lines.findIndex(l => l.startsWith('## Sanity checks'));
+  assert.ok(start >= 0, 'sanity section missing');
+  const row = lines.slice(start).find(l => l.startsWith(`| ${model} |`));
+  assert.ok(row, `no sanity row for ${model}`);
+  return row!;
+}
+
+// ---- D24: a host that collapses identical concurrent requests must be caught
+test('report FAILS the independent-samples check when responses are identical', async () => {
+  const { buildReport } = await import('./make-report5.js');
+  // every call returns the SAME text, as DeepInfra did for DeepSeek V3
+  const llm = mockClient(() => ({ content: good(0.5, 'an identical answer every single time') }));
+  const res = await runLadder(llm, EV, 'dupmodel', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  const md = buildReport(res.ledger.records, [{ modelKey: 'dupmodel', eventId: EV.id, outcomes: res.outcomes } as any]);
+  const row = sanityRow(md, 'dupmodel');
+  assert.ok(row.includes('FAIL'), 'identical worker answers must fail the check: ' + row);
+  assert.ok(/\d+\/\d+ distinct/.test(row), 'the row should report how many were distinct: ' + row);
+});
+
+test('report PASSES the independent-samples check when responses differ', async () => {
+  const { buildReport } = await import('./make-report5.js');
+  let n = 0;
+  const llm = mockClient(() => ({ content: good(0.4 + 0.01 * n, `distinct answer number ${n++}`) }));
+  const res = await runLadder(llm, EV, 'okmodel', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  const md = buildReport(res.ledger.records, [{ modelKey: 'okmodel', eventId: EV.id, outcomes: res.outcomes } as any]);
+  const row = sanityRow(md, 'okmodel');
+  assert.ok(!row.includes('distinct'), 'distinct answers must pass: ' + row);
+});

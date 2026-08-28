@@ -61,10 +61,20 @@ interface ModelSpec {
 // Prices here are for the offline estimate only; real cost comes from usage.cost.
 export const MODELS: ModelSpec[] = [
   { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 300 },
-  // minIntervalMs: the 2026-08-26 pilot lost 7 calls to upstream 429s on this
-  // model — the ladder bursts N concurrent workers at a shared, rate-limited
-  // endpoint. Spacing the starts turns the burst into a queue.
-  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324', provider: 'DeepInfra', mode: 'none',      arm: 'non-reasoning', evidence: 'all', priceIn: 0.24, priceOut: 0.90, minIntervalMs: 3000 },
+  // RE-PINNED 2026-08-28 (D24) from DeepInfra fp4 to SiliconFlow fp8.
+  //
+  // DeepInfra returned BYTE-IDENTICAL text for concurrent identical prompts —
+  // 6 responses, 2 distinct, same SHA-256 within each round — which at
+  // temperature 0.7 cannot come from independent sampling. It also produced
+  // degenerate output (whitespace, prompt echoes, runaway repetition). Both
+  // are fatal here: the communication-free rung IS independent repeated
+  // sampling, so a host that collapses identical concurrent requests destroys
+  // the baseline. Measured A/B on the real MSFT prompt, interleaved in one
+  // session: DeepInfra 0/6 well-formed, SiliconFlow 6/6 and 6 distinct.
+  // Qwen on DeepInfra was checked and is NOT affected (3/3 and 8/8 distinct).
+  //
+  // minIntervalMs is retained from the 2026-08-26 upstream-429 incident.
+  { key: 'deepseek-chat-v3-0324', slug: 'deepseek/deepseek-chat-v3-0324', provider: 'SiliconFlow', mode: 'none',      arm: 'non-reasoning', evidence: 'all', priceIn: 0.25, priceOut: 1.00, minIntervalMs: 3000 },
 ];
 
 /**
