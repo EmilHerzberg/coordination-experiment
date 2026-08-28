@@ -99,7 +99,25 @@ function status(line: string): void {
   console.log(line);
 }
 
-const events: EvidencePack[] = EVIDENCE_BLOCKS.map(b => ({ id: b.id, text: b.description }));
+// Evidence source. By default the synthetic pilot blocks; with PILOT5_PACKS set,
+// the real level-1 / level-2 packs exported from thesis.db by
+// scripts/20_build_evidence_packs.py. PILOT5_LEVEL picks the tier (1 or 2).
+const PACKS_PATH = process.env.PILOT5_PACKS ? resolve(OUTDIR, process.env.PILOT5_PACKS) : null;
+const LEVEL = (process.env.PILOT5_LEVEL ?? '1') === '2' ? 2 : 1;
+
+interface RealPack {
+  id: string; symbol: string; reportDate: string; t0: string;
+  label: number; abnormalReturn: number; level1: string; level2: string;
+}
+
+const events: EvidencePack[] = PACKS_PATH
+  ? (JSON.parse(readFileSync(PACKS_PATH, 'utf-8')) as RealPack[]).map(p => ({
+      // The label and the realised return are NEVER put into an evidence pack:
+      // they live only in the outcome file, so no model can read its own answer.
+      id: `${p.id}_L${LEVEL}`,
+      text: LEVEL === 2 ? p.level2 : p.level1,
+    }))
+  : EVIDENCE_BLOCKS.map(b => ({ id: b.id, text: b.description }));
 
 // ------------------------------------------------------------------ estimate
 function estimate(): void {
@@ -144,7 +162,7 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
   const overheadCache: Record<string, number> = existsSync(OVERHEAD_PATH)
     ? JSON.parse(readFileSync(OVERHEAD_PATH, 'utf-8'))
     : {};
-  writeFileSync(STATUS_PATH, `${MODE.toUpperCase()} start ${new Date().toISOString()} cap=$${CAP_USD}\n`);
+  writeFileSync(STATUS_PATH, `${MODE.toUpperCase()} start ${new Date().toISOString()} cap=$${CAP_USD} level=${LEVEL} evidence=${PACKS_PATH ? 'REAL' : 'synthetic'}\n`);
   if (!existsSync(LEDGER_PATH) || MODE === 'full') { writeFileSync(LEDGER_PATH, ''); writeFileSync(OUTCOMES_PATH, ''); writeFileSync(RAW_PATH, ''); }
 
   const roster = MODELS.filter(m => modelKeys.includes(m.key));
