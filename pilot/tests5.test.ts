@@ -21,7 +21,10 @@ function mockClient(script: Script, overhead = 7): LLMClient & { calls: Generate
       calls.push(req);
       const out = script(req, calls.length);
       const promptTokens = localTokens(req.systemPrompt) + localTokens(req.userPrompt) + overhead;
-      const reasoningTokens = out.reasoningTokens ?? 0;
+      // Default to a SELF-CONSISTENT provider: the reported reasoning token count
+      // matches the reasoning text actually returned. Tests that need the provider's
+      // figures to disagree set reasoningTokens explicitly.
+      const reasoningTokens = out.reasoningTokens ?? localTokens(out.reasoning ?? '');
       const completionTokens = localTokens(out.content) + reasoningTokens;
       const extras: ProviderExtras = { reasoningTokens, reasoningText: out.reasoning ?? '', content: out.content, finishReason: out.finishReason ?? 'stop' };
       const res: GenerateResponse & { extras: ProviderExtras } = {
@@ -65,14 +68,15 @@ test('stripThink removes an inline think block', () => {
 
 // --------------------------------------------------------------- ledger
 test('ledger identities hold on every call and buckets follow segment tags', async () => {
-  const llm = mockClient(() => ({ content: good(0.6), reasoning: 'thinking...', reasoningTokens: 40 }));
+  const TRACE = 'weighing the guidance raise against the one-time rebate and the soft European orders. '.repeat(3);
+  const llm = mockClient(() => ({ content: good(0.6), reasoning: TRACE }));
   const led = new Ledger5('workers', 'E1', 'mock');
   const r = await led.call(llm, 'worker_1', workerPrompt(EV), { temperature: 0.7 });
   const rec = r.record;
   assert.equal(rec.read.D + rec.read.A + rec.read.B + rec.read.B_SELF, rec.read.providerPrompt);
   assert.equal(rec.write.C1 + rec.write.C2, rec.write.providerCompletion);
   assert.equal(rec.read.A, 0); assert.equal(rec.read.B, 0); assert.equal(rec.read.B_SELF, 0);
-  assert.equal(rec.write.C2_hidden, 40);
+  assert.equal(rec.write.C2_hidden, localTokens(TRACE), 'a self-consistent trace is attributed exactly');
   assert.ok(rec.write.C1 >= 1 && rec.write.C1 <= 3, `C1 should be the bare number, got ${rec.write.C1}`);
   assert.ok(rec.read.gapShare > 0 && rec.read.gapShare < 0.2, 'template overhead shows up as a small positive gap');
 });
@@ -322,4 +326,46 @@ test('splitTokens sums exactly to the whole message and avoids boundary over-cou
   assert.equal(parts.reduce((a, b) => a + b, 0), lt(whole), 'parts must sum to the whole');
   const naive = segs.reduce((a, s) => a + lt(s.text), 0);
   assert.ok(naive >= lt(whole), 'per-segment tokenisation over-counts at boundaries');
+});
+
+// ---- hidden/visible split from local proportions, not the provider subtraction
+test('C2 hidden/visible comes from local proportions and sums to completion', async () => {
+  // Provider reports a reasoning count that does NOT decompose with the visible
+  // text (the pattern measured on Qwen/DeepInfra): reasoning is nearly the whole
+  // completion, leaving an impossible 5 tokens for a much longer answer.
+  const reasoning = 'thinking step '.repeat(60);          // ~120 local tokens
+  const content = good(0.42, 'visible reasoning text here that is clearly longer than five tokens.');
+  const llm: LLMClient = {
+    async generate() {
+      const res: GenerateResponse & { extras: ProviderExtras } = {
+        text: content, toolCalls: [],
+        usage: { promptTokens: 100, completionTokens: 200, totalTokens: 300 },
+        costUsd: 0, modelId: 'mock', durationMs: 1,
+        extras: { reasoningTokens: 195, reasoningText: reasoning, content, finishReason: 'stop' },
+      };
+      return res;
+    },
+  };
+  const led = new Ledger5('workers', 'E1', 'mock');
+  const r = await led.call(llm, 'worker_1', workerPrompt(EV), { temperature: 0.7 });
+  const w = r.record.write;
+  assert.equal(w.C1 + w.C2, w.providerCompletion, 'identity must still hold exactly');
+  assert.equal(w.C2_hidden + w.C2_visible, w.C2);
+  // the naive subtraction would have left only 200-195 = 5 tokens for the answer
+  assert.ok(w.C2_visible > 20, `visible must not be squeezed to the subtraction residual, got ${w.C2_visible}`);
+  // and the split should track the local proportion of the two texts
+  const { localTokens: lt } = await import('./ledger5.js');
+  const expectedHiddenShare = lt(reasoning) / (lt(reasoning) + lt(content));
+  const actualHiddenShare = w.C2_hidden / w.providerCompletion;
+  assert.ok(Math.abs(expectedHiddenShare - actualHiddenShare) < 0.02,
+    `hidden share ${actualHiddenShare.toFixed(3)} should track local proportion ${expectedHiddenShare.toFixed(3)}`);
+});
+
+test('non-reasoning models are unaffected: no trace means the old path', async () => {
+  const llm = mockClient(() => ({ content: good(0.5, 'plain answer'), reasoningTokens: 0 }));
+  const led = new Ledger5('workers', 'E1', 'mock');
+  const r = await led.call(llm, 'worker_1', workerPrompt(EV), { temperature: 0.7 });
+  const w = r.record.write;
+  assert.equal(w.C2_hidden, 0);
+  assert.equal(w.C1 + w.C2, w.providerCompletion);
 });

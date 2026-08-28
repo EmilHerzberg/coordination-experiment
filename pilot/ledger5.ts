@@ -307,11 +307,39 @@ export class Ledger5 {
     const decisionLocal = parsed ? localTokens(parsed.decisionRaw) : 0;
     const visibleLocal = localTokens(visible);
     const restLocal = Math.max(visibleLocal - decisionLocal, 0);
-    const w = rescale({ C1: decisionLocal, C2v: restLocal }, decisionLocal + restLocal, visibleBudget);
+    const reasoningLocal = localTokens(extras.reasoningText || '');
+
+    // Splitting the completion (measured 2026-08-28, 120 Qwen calls).
+    //
+    // We do NOT derive the visible part as `completion - reasoning_tokens`. That
+    // subtraction is unusable per call: localVisible / (completion - reasoning)
+    // has a coefficient of variation of 47 % and reaches 5.0, i.e. the implied
+    // "budget" is sometimes a fifth of the text that demonstrably exists.
+    //
+    // Instead both parts are counted with the SAME local tokenizer and rescaled
+    // to the provider's completion total — the identical principle used on the
+    // read side. One ruler measures both parts, so its bias cancels in the ratio,
+    // and the parts sum to the provider total by construction.
+    //
+    // This is sound because localReasoning / reasoning_tokens is a TIGHT constant
+    // (mean 0.880, CV 6.6 %): a stable multiplicative factor is what a tokenizer
+    // bias looks like, and it also shows the returned reasoning text is complete —
+    // a trace truncated at varying points could not produce a stable ratio.
+    //
+    // Fallback: if the provider reports reasoning tokens but returns no text, the
+    // proportion is unknowable, so we fall back to the subtraction for that call.
+    const haveTrace = reasoningLocal > 0;
+    const w = haveTrace
+      ? rescale(
+          { C1: decisionLocal, C2v: restLocal, C2h: reasoningLocal },
+          decisionLocal + restLocal + reasoningLocal,
+          providerCompletion,
+        )
+      : { ...rescale({ C1: decisionLocal, C2v: restLocal }, decisionLocal + restLocal, visibleBudget), C2h: providerReasoning };
     const write: WriteSideCounts = {
       C1: w.C1,
-      C2: w.C2v + providerReasoning,
-      C2_hidden: providerReasoning,
+      C2: w.C2v + w.C2h,
+      C2_hidden: w.C2h,
       C2_visible: w.C2v,
       providerCompletion,
       providerReasoning,
