@@ -23,6 +23,11 @@ interface OutcomeLine {
   outcomes: Record<StructureName, { probability: number | null; dropped: boolean; dropReason?: string }>;
   /** [round0(workers), round1, ...] — D14 spread/collapse diagnostic. */
   roundProbabilities?: number[][];
+  /** D23 compute matching: one entry per communicating structure. */
+  matched?: { structure: StructureName; structureTokens: number; runsUsed: number;
+              matchedTokens: number; residualTokens: number;
+              probability: number | null; structureProbability: number | null }[];
+  repetitionRuns?: { probability: number; totalTokens: number }[];
 }
 
 export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]): string {
@@ -119,6 +124,26 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   for (const o of outcomes) {
     const f = (s: StructureName) => o.outcomes[s].dropped ? `DROP (${o.outcomes[s].dropReason?.slice(0, 40)})` : o.outcomes[s].probability!.toFixed(2);
     L.push(`| ${o.modelKey} | ${o.eventId} | ${f('repetition')} | ${f('aggregator')} | ${f('debate')} |`);
+  }
+  L.push('');
+  L.push('## Compute-matched comparisons (D23) — the numbers RQ1 is computed from');
+  L.push('');
+  L.push("_Each communicating structure is paired with the communication-free rung given the SAME budget. Budget = total tokens (prompt + completion, as billed) that the structure spent, including the three shared workers. The baseline is drawn by repeating single-agent runs until the cumulative spend covers the largest budget; each structure is then compared against the PREFIX of those runs that fits its own budget, taken in generation order so no favourable subset can be selected afterwards. `residual` is the shortfall left by the fits-rule and is reported, never hidden (working doc §4.2)._");
+  L.push('');
+  const withMatched = outcomes.filter(o => o.matched && o.matched.length);
+  if (!withMatched.length) L.push('no matched comparisons recorded');
+  else {
+    L.push('| model | structure | events | mean budget (tok) | mean runs matched | mean residual (tok) | residual % |');
+    L.push('|---|---|---:|---:|---:|---:|---:|');
+    for (const m of [...new Set(withMatched.map(o => o.modelKey))]) {
+      for (const s of STRUCTURES) {
+        const rows = withMatched.flatMap(o => (o.modelKey === m ? o.matched!.filter(x => x.structure === s) : []));
+        if (!rows.length) continue;
+        const mean = (f: (x: typeof rows[number]) => number) => rows.reduce((a, x) => a + f(x), 0) / rows.length;
+        const res = mean(x => x.residualTokens), bud = mean(x => x.structureTokens);
+        L.push(`| ${m} | ${s} | ${rows.length} | ${bud.toFixed(0)} | ${mean(x => x.runsUsed).toFixed(1)} | ${res.toFixed(0)} | ${(res / bud * 100).toFixed(1)}% |`);
+      }
+    }
   }
   L.push('');
   L.push('## Agent spread per debate round (D14 diagnostic)');

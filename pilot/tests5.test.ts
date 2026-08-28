@@ -7,7 +7,7 @@ import type { GenerateRequest, GenerateResponse, LLMClient } from '../src/types.
 import { parseTagged, stripThink, TaggedParseError } from './tagged.js';
 import { Ledger5, localTokens, summarize, MalformedCallError, type ProviderExtras } from './ledger5.js';
 import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
-import { runLadder, structureRecords, COMBINER_ROLES } from './structures5.js';
+import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 
 // ------------------------------------------------------------------ mock
 type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number; finishReason?: string };
@@ -138,8 +138,12 @@ test('runLadder: repetition has A=B=0; aggregator commCost = whole aggregator ca
   assert.ok(Math.abs(res.outcomes.repetition.probability! - 0.4) < 1e-9);
   assert.equal(res.outcomes.aggregator.probability, 0.55);
   assert.equal(res.outcomes.debate.probability, 0.5);
-  // 3 workers + 1 aggregator + 3×2 debate = 10 calls
-  assert.equal(res.ledger.records.length, 10);
+  // 3 workers + 1 aggregator + 3x2 debate = 10 structure calls, PLUS the extra
+  // single-agent runs drawn for compute matching (D23), which live under
+  // structure='repetition'.
+  const structureCalls = res.ledger.records.filter(r => r.structure !== 'repetition');
+  assert.equal(structureCalls.length, 10);
+  assert.ok(res.ledger.records.length > 10, 'compute matching must add repetition runs');
 
   const rep = summarize(structureRecords(res.ledger.records, 'repetition'), COMBINER_ROLES);
   assert.equal(rep.A, 0); assert.equal(rep.B, 0); assert.equal(rep.commCost, 0);
@@ -368,4 +372,60 @@ test('non-reasoning models are unaffected: no trace means the old path', async (
   const w = r.record.write;
   assert.equal(w.C2_hidden, 0);
   assert.equal(w.C1 + w.C2, w.providerCompletion);
+});
+
+// ------------------------------------------------- D23 compute matching
+test('compute matching: baseline is drawn up to the largest budget, prefix FITS, residual reported', async () => {
+  const llm = mockClient(req => ({
+    content: good(0.5, `${req.metadata?.agentRole} reasoning of some length to spend tokens.`),
+  }));
+  const res = await runLadder(llm, EV, 'mock', {
+    agentCount: 3, debateRounds: 2, temperature: 0.7, aggregate: 'mean',
+  });
+  assert.equal(res.matched.length, 2, 'one comparison per communicating structure');
+
+  const byName = Object.fromEntries(res.matched.map(m => [m.structure, m]));
+  const debate = byName['debate'], agg = byName['aggregator'];
+
+  // the debate is the most expensive, so it sets the ceiling
+  assert.ok(debate.structureTokens > agg.structureTokens, 'debate should cost more than the aggregator');
+
+  // extra runs were actually drawn beyond the three shared workers
+  assert.ok(res.repetitionRuns.length > 3, `expected extra runs, got ${res.repetitionRuns.length}`);
+
+  for (const m of res.matched) {
+    // FITS rule: never over budget, and the residual is exactly the shortfall
+    assert.ok(m.matchedTokens <= m.structureTokens, `${m.structure}: matched must not exceed budget`);
+    assert.equal(m.residualTokens, m.structureTokens - m.matchedTokens);
+    // the prefix really is a prefix, in generation order
+    const expected = res.repetitionRuns.slice(0, m.runsUsed).reduce((a, r) => a + r.totalTokens, 0);
+    assert.equal(m.matchedTokens, expected, `${m.structure}: matched tokens must be the prefix sum`);
+    // adding one more run would have exceeded the budget (the prefix is maximal)
+    const next = res.repetitionRuns[m.runsUsed];
+    if (next) assert.ok(m.matchedTokens + next.totalTokens > m.structureTokens, `${m.structure}: prefix must be maximal`);
+    assert.equal(m.probability, combine(res.repetitionRuns.slice(0, m.runsUsed).map(r => r.probability), 'mean'));
+  }
+  // a cheaper structure gets a shorter prefix than a more expensive one
+  assert.ok(agg.runsUsed <= debate.runsUsed, 'the cheaper structure is matched with fewer runs');
+});
+
+test('compute matching: the first three repetition runs ARE the shared workers', async () => {
+  let n = 0;
+  const probs = [0.10, 0.20, 0.30];
+  const llm = mockClient(req => {
+    const role = req.metadata?.agentRole ?? '';
+    const p = role.startsWith('worker') ? probs[n++] : 0.5;
+    return { content: good(p, 'text of a reasonable length for token accounting purposes.') };
+  });
+  const res = await runLadder(llm, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  assert.deepEqual(res.repetitionRuns.slice(0, 3).map(r => r.probability), probs,
+    'the shared workers must head the repetition sequence, in order');
+});
+
+test('compute matching: a dropped structure gets no comparison', async () => {
+  const badAgg = mockClient(req => (req.metadata?.agentRole === 'aggregator' ? { content: 'nope' } : { content: good(0.5, 'some reasoning text here') }));
+  const res = await runLadder(badAgg, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  assert.equal(res.outcomes.aggregator.dropped, true);
+  assert.ok(!res.matched.some(m => m.structure === 'aggregator'), 'no matched comparison for a dropped structure');
+  assert.ok(res.matched.some(m => m.structure === 'debate'), 'the surviving structure still gets one');
 });

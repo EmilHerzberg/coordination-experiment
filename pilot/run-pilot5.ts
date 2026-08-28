@@ -209,12 +209,14 @@ async function run(modelKeys: string[], evLimit: number | null): Promise<void> {
       const res = await runLadder(client, ev, m.key, paramsByModel.get(m.key)!);
       // appendFileSync is synchronous, so concurrent writers cannot interleave a line.
       for (const r of res.ledger.records) appendFileSync(LEDGER_PATH, JSON.stringify(r) + '\n');
-      appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities }) + '\n');
+      appendFileSync(OUTCOMES_PATH, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities, matched: res.matched, repetitionRuns: res.repetitionRuns }) + '\n');
       const line = STRUCTURES.map(s => {
         const o = res.outcomes[s];
         const t = summarize(structureRecords(res.ledger.records, s), COMBINER_ROLES);
         if (o.dropped) dropped++;
-        return `${s}=${o.dropped ? 'DROP' : o.probability!.toFixed(2)}(comm ${t.commCost})`;
+        const mm = res.matched.find(x => x.structure === s);
+        const vs = mm && mm.probability !== null ? ` vs rep@${mm.runsUsed}run=${mm.probability.toFixed(2)}` : '';
+        return `${s}=${o.dropped ? 'DROP' : o.probability!.toFixed(2)}(comm ${t.commCost})${vs}`;
       }).join(' ');
       done++;
       status(`[${MODE}] (${done}/${tasks.length}) ${m.key} | ${ev.id} | ${line} | ${((Date.now() - t0) / 1000).toFixed(0)}s | $${cost.spentUsd.toFixed(4)}`);

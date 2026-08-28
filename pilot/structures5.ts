@@ -49,6 +49,29 @@ export interface StructureOutcome {
   dropReason?: string;
 }
 
+/**
+ * One compute-matched comparison: a communicating structure against the
+ * communication-free rung given the same budget (D23).
+ *
+ * The exposé's central claim is that structures are compared "at the same cost",
+ * so this is the object RQ1 is actually computed from.
+ */
+export interface MatchedComparison {
+  structure: StructureName;
+  /** Total tokens the structure itself spent, including the shared workers. */
+  structureTokens: number;
+  /** How many repetition runs fit inside that budget, in generation order. */
+  runsUsed: number;
+  /** Total tokens those runs spent. Always <= structureTokens (fits-rule). */
+  matchedTokens: number;
+  /** structureTokens - matchedTokens. Reported, never hidden (working doc §4.2). */
+  residualTokens: number;
+  /** The repetition rung's answer at this budget: the combined probability. */
+  probability: number | null;
+  /** The structure's own answer, repeated here so the pair travels together. */
+  structureProbability: number | null;
+}
+
 export interface EventRunResult {
   eventId: string;
   modelKey: string;
@@ -67,6 +90,18 @@ export interface EventRunResult {
    *    against that instruction is the stronger of the two possible findings.
    */
   roundProbabilities: number[][];
+  /**
+   * Compute matching (D23). One entry per communicating structure, each pairing
+   * it with the communication-free rung at its own budget.
+   */
+  matched: MatchedComparison[];
+  /**
+   * Every repetition run's probability and token cost, in GENERATION order.
+   * Order is preserved and never re-sorted, so no favourable subset can be
+   * selected after the fact (working doc §4.2). The first `agentCount` entries
+   * are the shared workers.
+   */
+  repetitionRuns: { probability: number; totalTokens: number }[];
 }
 
 /** Max-minus-min of a probability vector; 0 means the agents agree exactly. */
@@ -89,7 +124,11 @@ export function combine(ps: number[], how: 'mean' | 'median'): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-/** Records that belong to a structure's cost = shared workers + own calls. */
+/**
+ * Records that belong to a structure's cost = the shared workers + its own calls.
+ * For 'repetition' this now also picks up the extra runs drawn for compute
+ * matching (D23), which are logged under structure='repetition'.
+ */
 export function structureRecords(all: CallLedgerRecord[], s: StructureName): CallLedgerRecord[] {
   return all.filter(r => r.structure === 'workers' || r.structure === s);
 }
@@ -123,7 +162,7 @@ export async function runLadder(
   const workerFail = firstFailure(workerSettled, 'worker');
   if (workerFail) {
     for (const s of STRUCTURES) outcomes[s] = drop(workerFail);
-    return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities };
+    return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched: [], repetitionRuns: [] };
   }
   const workers = workerSettled.map(r => (r as PromiseFulfilledResult<LedgerCallResult>).value);
   roundProbabilities.push(workers.map(w => w.parsed.probability));   // round 0 = the shared workers
@@ -172,8 +211,78 @@ export async function runLadder(
       : { probability: combine(states.map(s => s.probability), p.aggregate), dropped: false };
   }
 
-  return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities };
+  // ---- compute matching (D23). The communicating structures have now run and
+  // their spend is known, so the communication-free rung is drawn up to the
+  // largest of those budgets and each structure is paired with the prefix of
+  // runs that fits its own.
+  const repetitionRuns = workers.map(w => ({
+    probability: w.parsed.probability,
+    totalTokens: w.record.totalTokens,
+  }));
+  const matched: MatchedComparison[] = [];
+  if (!outcomes.repetition.dropped) {
+    // Budget per structure = the shared workers + that structure's own calls.
+    // Measured in TOTAL tokens (prompt + completion), as billed: the exposé asks
+    // which topology used the most tokens, and read tokens are real cost here
+    // (communication cost is A + B, both read-side).
+    const workerTokens = repetitionRuns.reduce((a, r) => a + r.totalTokens, 0);
+    const ownTokens = (s: StructureName) =>
+      ledger.records
+        .filter(r => r.ok && r.structure === s)
+        .reduce((a, r) => a + r.totalTokens, 0);
+    const budgets = new Map<StructureName, number>();
+    for (const s of STRUCTURES) {
+      if (s === 'repetition' || outcomes[s].dropped) continue;
+      budgets.set(s, workerTokens + ownTokens(s));
+    }
+
+    if (budgets.size > 0) {
+      const ceiling = Math.max(...budgets.values());
+      // Draw further single-agent runs until the cumulative spend covers the
+      // ceiling. They are identical to the workers: same prompt, no coordination.
+      const sub = withStructure(ledger, 'repetition');
+      let spent = workerTokens;
+      let guard = 0;
+      while (spent < ceiling && guard++ < MAX_EXTRA_RUNS) {
+        try {
+          const r = await sub.call(llm, `rep_${repetitionRuns.length + 1}`, workerPrompt(ev), {
+            maxTokens: p.maxTokensPerCall, temperature: p.temperature,
+            maxAttempts: p.maxParseAttempts, round: 0,
+          });
+          repetitionRuns.push({ probability: r.parsed.probability, totalTokens: r.record.totalTokens });
+          spent += r.record.totalTokens;
+        } catch {
+          break;   // a malformed extra run stops the draw; the shortfall is reported
+        }
+      }
+
+      for (const [s, budget] of budgets) {
+        // Prefix that FITS: take runs in generation order while they stay inside
+        // the budget. Never re-sorted, so no favourable subset can be chosen
+        // afterwards. The resulting shortfall is reported, not hidden.
+        let used = 0, tokens = 0;
+        for (const run of repetitionRuns) {
+          if (tokens + run.totalTokens > budget) break;
+          tokens += run.totalTokens; used++;
+        }
+        matched.push({
+          structure: s,
+          structureTokens: budget,
+          runsUsed: used,
+          matchedTokens: tokens,
+          residualTokens: budget - tokens,
+          probability: used > 0 ? combine(repetitionRuns.slice(0, used).map(r => r.probability), p.aggregate) : null,
+          structureProbability: outcomes[s].probability,
+        });
+      }
+    }
+  }
+
+  return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched, repetitionRuns };
 }
+
+/** Safety stop on the matching draw, so a cheap-run/expensive-structure ratio cannot loop away. */
+const MAX_EXTRA_RUNS = 200;
 
 function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): string | null {
   for (const r of settled) {
