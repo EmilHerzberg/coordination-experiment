@@ -54,7 +54,27 @@ export function parseTagged(text: string): TaggedOutput {
   let probability: number;
   const pct = /^(\d{1,3}(?:\.\d+)?)\s*%$/.exec(decisionRaw);
   if (pct) {
-    probability = Number(pct[1]) / 100;
+    // "0.35%" cannot be read safely. As written it is 0.0035, but a model that
+    // meant 0.35 and appended a percent sign out of habit writes exactly this,
+    // and the two readings differ by a factor of 100 - the difference between
+    // "roughly even odds" and "practically impossible". Guessing either way
+    // would put a fabricated number into a proper scoring rule, so an ambiguous
+    // answer is refused. The caller retries, and if the model keeps writing it
+    // the attempt is counted as a genuine format failure, which is the honest
+    // record.
+    //
+    // A whole number with a percent sign has no second reading: "35%" is 0.35,
+    // "1%" is 0.01. Only a value at or below 1 written WITH decimals is
+    // ambiguous.
+    const written = Number(pct[1]);
+    if (written <= 1 && pct[1].includes('.')) {
+      throw new TaggedParseError(
+        `ambiguous decision "${decisionRaw}": as written this is ${written / 100}, ` +
+        `but it may mean ${written}; state a bare probability such as "${written}" instead`,
+        text,
+      );
+    }
+    probability = written / 100;
   } else if (/^(1(?:\.0+)?|0(?:\.\d+)?|\.\d+)$/.test(decisionRaw)) {
     probability = Number(decisionRaw);
   } else {

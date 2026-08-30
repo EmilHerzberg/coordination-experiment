@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { GenerateRequest, GenerateResponse, LLMClient } from '../src/types.js';
 import { parseTagged, stripThink, TaggedParseError } from './tagged.js';
-import { Ledger5, localTokens, summarize, MalformedCallError, type ProviderExtras } from './ledger5.js';
+import { Ledger5, localTokens, summarize, splitTokens, MalformedCallError, type ProviderExtras } from './ledger5.js';
 import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 
@@ -460,4 +460,145 @@ test('report PASSES the independent-samples check when responses differ', async 
   const md = buildReport(res.ledger.records, [{ modelKey: 'okmodel', eventId: EV.id, outcomes: res.outcomes } as any]);
   const row = sanityRow(md, 'okmodel');
   assert.ok(!row.includes('distinct'), 'distinct answers must pass: ' + row);
+});
+
+
+// ==========================================================================
+// Regression tests for the 2026-08-29 edge-case audit. Each one reproduces a
+// bug that ran without error and returned a plausible wrong number. See
+// scaffold/EDGE_AUDIT_2026-08-29.md for the full finding.
+// ==========================================================================
+
+// ---- pct-ambiguity-100x
+test('audit: a probability written with BOTH decimals and a percent sign is refused', () => {
+  const wrap = (d: string) => '<reason>because</reason><decision>' + d + '</decision>';
+  // Unambiguous, must parse.
+  const okCases: [string, number][] = [['35%', 0.35], ['100%', 1], ['0%', 0], ['1%', 0.01], ['50 %', 0.5]];
+  for (const [written, expected] of okCases) {
+    assert.equal(parseTagged(wrap(written)).probability, expected, written);
+  }
+  // Ambiguous by a factor of 100: "0.35%" is 0.0035 as written, but a model that
+  // meant 0.35 writes exactly this. Guessing either way fabricates a forecast.
+  for (const written of ['0.35%', '0.5%', '1.0%']) {
+    assert.throws(() => parseTagged(wrap(written)), TaggedParseError, written + ' must be refused');
+  }
+});
+
+// ---- combine-unrounded-mean
+test('audit: combine() returns one canonical double, independent of agent order', () => {
+  // Three agents unanimously saying 0.7 used to produce 0.6999999999999998,
+  // which the analysis then binned one decile TOO LOW.
+  assert.equal(combine([0.7, 0.7, 0.7], 'mean'), 0.7);
+  assert.equal(combine([0.65, 0.7, 0.75], 'mean'), 0.7);
+  assert.equal(combine([0.4, 0.5], 'median'), 0.45);
+
+  // Order-independence over the whole answer grid the models actually use.
+  const grid: number[] = [];
+  for (let k = 6; k <= 14; k++) grid.push(k * 0.05);
+  const byMultiset = new Map<string, Set<number>>();
+  for (const a of grid) for (const b of grid) for (const c of grid) {
+    const key = [a, b, c].slice().sort((x, y) => x - y).join(',');
+    if (!byMultiset.has(key)) byMultiset.set(key, new Set<number>());
+    byMultiset.get(key)!.add(combine([a, b, c], 'mean'));
+  }
+  let orderDependent = 0;
+  let belowEdge = 0;
+  for (const [, vals] of byMultiset) {
+    if (vals.size > 1) orderDependent++;
+    const v = [...vals][0];
+    const decile = Math.round(v * 10) / 10;
+    if (Math.abs(v - decile) < 1e-9 && v < decile) belowEdge++;
+  }
+  assert.equal(orderDependent, 0, 'the forecast must be a function of the answers alone');
+  assert.equal(belowEdge, 0, 'a mean on a decile edge must never be emitted below it');
+});
+
+// ---- splittokens-clamp-overcounts
+test('audit: splitTokens parts always add up to the whole', () => {
+  const cases: string[][] = [
+    ['hello ', 'world'],
+    ['', 'only the second segment'],
+    ['   ', 'leading whitespace segment'],
+    ['a', 'b', 'c', 'd', 'e'],
+    ['--- Analyst 1 ---', ' some reasoning text here', '--- Analyst 2 ---', ' more reasoning'],
+    ['one'],
+  ];
+  for (const texts of cases) {
+    const segs = texts.map((text, i) => ({ bucket: 'D' as const, text, label: 'seg' + i }));
+    const parts = splitTokens(segs);
+    const whole = localTokens(texts.join(''));
+    assert.equal(parts.reduce((a, b) => a + b, 0), whole, JSON.stringify(texts));
+    assert.ok(parts.every(x => x >= 0), 'no negative segment: ' + JSON.stringify(texts));
+    assert.equal(parts.length, texts.length);
+  }
+});
+
+// ---- malformed-attempt-tokens-dropped
+test('audit: a discarded retry stays out of the buckets but inside the billed totals', async () => {
+  // Attempt 1 is cut off by the token cap, attempt 2 succeeds.
+  let n = 0;
+  const llm = mockClient(() => (++n === 1
+    ? { content: '<reason>still writing when the cap hit', finishReason: 'length' }
+    : { content: good(0.55) }));
+  const led = new Ledger5('aggregator', EV.id, 'mock');
+  await led.call(llm, 'aggregator', aggregatorPrompt(EV, ['alpha', 'beta', 'gamma']), { temperature: 0.7 });
+
+  const billed = led.records.reduce((a, r) => a + r.totalTokens, 0);
+  assert.equal(led.records.length, 2, 'both attempts are recorded');
+  const t = summarize(led.records, ['aggregator']);
+
+  // The buckets cover usable calls only: a malformed answer has no parseable
+  // decision, so there is no honest C1 to book.
+  assert.equal(t.calls, 1);
+  assert.ok(t.total < billed, 'the bucket total excludes the discarded attempt');
+  // The money was spent either way, so the billed figures must match reality.
+  assert.equal(t.billedTotal, billed);
+  assert.equal(t.billedCommCost, billed, 'the whole combiner call is communication cost');
+  assert.equal(t.billedPrompt + t.billedCompletion, billed);
+});
+
+// ---- budget-excludes-retries
+test('audit: the compute-match budget counts every attempt that was billed', async () => {
+  let burned = false;
+  const llm = mockClient((req) => {
+    const role = String((req as any).metadata?.agentRole ?? '');
+    if (role.startsWith('debater_') && !burned) {
+      burned = true;
+      return { content: '<reason>cut off mid sentence', finishReason: 'length' };
+    }
+    return { content: good(0.45, 'a reasoning section of a realistic length for this test') };
+  });
+  const res = await runLadder(llm, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+
+  const debateMatch = res.matched.find(mm => mm.structure === 'debate');
+  assert.ok(debateMatch, 'the debate should have a matched comparison');
+  const billedDebate = res.ledger.records
+    .filter(r => r.structure === 'workers' || r.structure === 'debate')
+    .reduce((a, r) => a + r.totalTokens, 0);
+  assert.equal(debateMatch!.structureTokens, billedDebate,
+    'the budget must be what the structure really spent, retries included');
+  assert.ok(res.ledger.records.some(r => r.malformed), 'the test must actually produce a discarded attempt');
+});
+
+// ---- dropped-debate-round-data
+test('audit: a debate that drops leaves no partial rounds behind', async () => {
+  // Round 1 succeeds for everyone, round 2 fails: the event is dropped, so its
+  // half-finished rounds must not enter the convergence table.
+  // The request metadata carries the agent role but not the round number, so
+  // the round is identified by counting: with 3 agents, calls 1-3 are round 1
+  // and calls 4-6 are round 2.
+  let debaterCalls = 0;
+  const llm = mockClient((req) => {
+    const role = String((req as any).metadata?.agentRole ?? '');
+    if (role.startsWith('debater_')) {
+      debaterCalls++;
+      if (debaterCalls > 3) return { content: 'no tags at all' };
+    }
+    return { content: good(0.5, 'a reasoning section for this round') };
+  });
+  const res = await runLadder(llm, EV, 'mock', { agentCount: 3, debateRounds: 2, temperature: 0.7, aggregate: 'mean' });
+  assert.ok(debaterCalls > 3, 'round 1 must have completed before round 2 failed');
+  assert.equal(res.outcomes.debate.dropped, true, 'the debate must be dropped');
+  assert.equal(res.roundProbabilities.length, 1,
+    'only round 0 (the shared workers) may survive a dropped debate');
 });

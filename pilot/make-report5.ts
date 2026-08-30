@@ -47,7 +47,13 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
     for (const s of STRUCTURES) {
       const t = summarize(structureRecords(mine, s), COMBINER_ROLES);
       perModelStruct.set(`${m}|${s}`, t);
-      L.push(`| ${m} | ${s} | ${t.calls} | ${t.D} | ${t.A} | ${t.B} | ${t.B_SELF} | ${t.C1} | ${t.C2} (${t.C2_hidden}) | ${t.total} | **${t.commCost}** | ${t.commCostInclSelf} | ${t.malformedAttempts} | ${t.wastedTokens} | ${(t.maxReadGap * 100).toFixed(1)}% | ${t.maxVisibleDiscrepancy} | ${t.costUsd.toFixed(4)} |`);
+      // `total` covers usable calls only; `billedTotal` adds the attempts that
+      // were discarded and retried. They differ exactly when something failed,
+      // and the difference is what compute matching is drawn to, so both are
+      // shown rather than one standing in for the other.
+      const billedNote = t.billedTotal === t.total ? `${t.total}` : `${t.total} (billed ${t.billedTotal})`;
+      const commNote = t.billedCommCost === t.commCost ? `**${t.commCost}**` : `**${t.commCost}** (billed ${t.billedCommCost})`;
+      L.push(`| ${m} | ${s} | ${t.calls} | ${t.D} | ${t.A} | ${t.B} | ${t.B_SELF} | ${t.C1} | ${t.C2} (${t.C2_hidden}) | ${billedNote} | ${commNote} | ${t.commCostInclSelf} | ${t.malformedAttempts} | ${t.wastedTokens} | ${(t.maxReadGap * 100).toFixed(1)}% | ${t.maxVisibleDiscrepancy} | ${t.costUsd.toFixed(4)} |`);
     }
   }
   L.push('');
@@ -163,7 +169,7 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push('## Agent spread per debate round (D14 diagnostic)');
   L.push('');
-  L.push("_Round 0 = the shared workers. Spread = max minus min of the agents' probabilities in that round; SD in brackets. Two things to read here. (a) If round-0 spread is near zero, temperature 0.7 is not producing a real ensemble: averaging buys nothing and the debate has nothing to argue about. (b) If spread shrinks across rounds, the agents converged DESPITE the explicit instruction not to converge merely to converge (D11) — the stronger of the two possible findings._");
+  L.push("_Round 0 = the shared workers. Spread = max minus min of the agents' probabilities in that round; SD in brackets. Two things to read here. (a) If round-0 spread is near zero, temperature 0.7 is not producing a real ensemble: averaging buys nothing and the debate has nothing to argue about. (b) If spread shrinks across rounds, the agents converged DESPITE the explicit instruction not to converge merely to converge (D11) — the stronger of the two possible findings. The `events` column counts the events contributing to round 0; where a later column rests on fewer, its own `n` is printed in the cell, and only columns with the same n are directly comparable._");
   L.push('');
   const withRounds = outcomes.filter(o => o.roundProbabilities && o.roundProbabilities.length);
   if (!withRounds.length) {
@@ -179,7 +185,14 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
         const vecs = mine.map(o => o.roundProbabilities![r]).filter(v => Array.isArray(v) && v.length > 0);
         if (!vecs.length) { cells.push('n/a'); continue; }
         const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-        cells.push(`${mean(vecs.map(spread)).toFixed(3)} (${mean(vecs.map(sd)).toFixed(3)})`);
+        // n per COLUMN, not once per row. Each column averages over the events
+        // that reached that round, and a debate can end early, so the columns do
+        // not in general cover the same events. Printing a single event count
+        // for the row invited exactly the comparison that is not valid: reading
+        // a spread shrinking from round 1 to round 2 as convergence when the two
+        // figures may rest on different events.
+        const suffix = vecs.length === mine.length ? '' : ` n=${vecs.length}`;
+        cells.push(`${mean(vecs.map(spread)).toFixed(3)} (${mean(vecs.map(sd)).toFixed(3)})${suffix}`);
       }
       L.push(`| ${m} | ${mine.length} | ${cells.join(' | ')} |`);
     }

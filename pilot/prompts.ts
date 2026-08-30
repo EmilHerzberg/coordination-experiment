@@ -42,10 +42,27 @@ in your probability instead.`;
 
 // A2 CLOSED 2026-08-25 (D6): empty template only — no filled example (anchoring),
 // percent safety net stays unadvertised, strict "and nothing else".
+//
+// D27 AMENDMENT 2026-08-29: the sentence keeping the probability out of the
+// reasoning text. AGGREGATOR_ROLE tells the aggregator it is shown the analysts'
+// reasoning "without their final numbers", but the code only ever stripped the
+// <decision> TAG - a number stated in prose passed straight through. Measured on
+// the pilot logs: 3 of 12 worker answers stated their own probability in the
+// reasoning (all qwen3-32b, 3 of its 6 worker calls), both qwen aggregator calls
+// received at least one, and in L2 the aggregator wrote "arriving at 45%" about
+// Analyst 2 and returned exactly 0.45. Rung 2 was therefore not blind
+// aggregation for those events, and the prompt was asserting something false to
+// the model, which is worse than asserting nothing.
+//
+// Fixed at the SOURCE rather than by filtering the models' text afterwards: no
+// output is altered, and the line sits in FORMAT_INSTRUCTION, which all three
+// rungs and the single-agent baseline share, so bucket A stays identical across
+// conditions. The residual leak rate is still measured per run (see
+// reasonStatesOwnNumber) because compliance will not be perfect.
 export const FORMAT_INSTRUCTION = `\
 Answer in exactly two tagged sections and nothing else:
 <reason>
-Your reasoning, as long or short as you need.
+Your reasoning, as long or short as you need. State your probability only in the decision section below, not here.
 </reason>
 <decision>
 A single number between 0 and 1.
@@ -182,4 +199,33 @@ export function debateRevisePrompt(
     ],
     user,
   };
+}
+
+
+/**
+ * Did this reasoning text state the answer's OWN probability in prose?
+ *
+ * Deliberately narrow: it looks for the model's own final number, not for any
+ * percentage. Reasoning legitimately cites figures ("revenue up 10%", "the
+ * stock fell 3.2%"), so a general percent detector would fire constantly and
+ * measure nothing. Matching the answer's own value catches exactly the leak
+ * that matters - the number the aggregator could copy, and in the pilot did.
+ *
+ * Known limits, stated because this figure is reported: a reason that says
+ * "roughly even odds" without a numeral is not caught, and a cited figure that
+ * happens to coincide with the forecast (a stock down 45% in an answer of 0.45)
+ * is a false positive. It is a floor on the leak rate, not an exact count.
+ */
+export function reasonStatesOwnNumber(reason: string, probability: number): boolean {
+  const pct = Math.round(probability * 100);
+  const forms = [
+    probability.toFixed(2),                       // 0.45
+    String(probability),                          // 0.45
+    '.' + String(pct).padStart(2, '0'),           // .45
+    pct + '%',
+    pct + ' %',
+    pct + ' percent',
+  ];
+  const hay = reason.toLowerCase();
+  return forms.some(f => hay.includes(f.toLowerCase()));
 }

@@ -13,7 +13,7 @@
 
 import type { LLMClient } from '../src/types.js';
 import { Ledger5, MalformedCallError, type CallLedgerRecord, type LedgerCallResult } from './ledger5.js';
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt, type EvidencePack } from './prompts.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, reasonStatesOwnNumber, type EvidencePack } from './prompts.js';
 
 export interface LadderParams {
   agentCount: number;          // N
@@ -102,6 +102,14 @@ export interface EventRunResult {
    * are the shared workers.
    */
   repetitionRuns: { probability: number; totalTokens: number }[];
+  /**
+   * How many of the workers' reasoning sections still stated their own
+   * probability in prose, despite the format instruction telling them not to
+   * (D27). The aggregator is described to the model as seeing reasoning without
+   * final numbers, so any count above zero is a partial breach of rung 2's
+   * defining condition and must be reported rather than assumed away.
+   */
+  aggregatorNumberLeaks: number;
 }
 
 /** Max-minus-min of a probability vector; 0 means the agents agree exactly. */
@@ -116,12 +124,37 @@ export function sd(ps: number[]): number {
   return Math.sqrt(ps.reduce((a, b) => a + (b - m) ** 2, 0) / ps.length);
 }
 
+/**
+ * Round a probability to 9 decimals.
+ *
+ * Not cosmetic. The models answer on a 0.05 grid, and multiples of 0.05 are not
+ * exactly representable in binary, so an average of them lands 1-2 ULP off the
+ * decimal it means. Three agents who all say 0.7 produce 0.6999999999999998,
+ * which the analysis then bins one decile TOO LOW - the very bug that
+ * `21_metrics.py` rounds its bin edges to prevent, reintroduced here where that
+ * fix cannot reach. The floating-point sum is also order-dependent: 26% of
+ * three-agent answer multisets gave a different double depending on which
+ * worker replied first, so the recorded forecast was not a function of the
+ * agents' answers alone. And because `murphy(n_bins=None)` groups by DISTINCT
+ * value, identical forecasts split into separate groups and invent resolution
+ * out of noise.
+ *
+ * Nine decimals is far finer than any probability these models can mean and far
+ * coarser than the 1e-16 noise being removed. `21_metrics.py` canonicalises
+ * with the same rule (FORECAST_DECIMALS = 9) at the point it scores, so both
+ * sides of the pipeline agree on when two forecasts are the same forecast.
+ */
+export function canon(p: number): number {
+  return Math.round(p * 1e9) / 1e9;
+}
+
 export function combine(ps: number[], how: 'mean' | 'median'): number {
   if (ps.length === 0) throw new Error('combine(): empty');
-  if (how === 'mean') return ps.reduce((a, b) => a + b, 0) / ps.length;
+  if (how === 'mean') return canon(ps.reduce((a, b) => a + b, 0) / ps.length);
   const s = ps.slice().sort((a, b) => a - b);
   const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  // The two-element median is an average too, so it needs the same treatment.
+  return s.length % 2 ? canon(s[m]) : canon((s[m - 1] + s[m]) / 2);
 }
 
 /**
@@ -149,6 +182,7 @@ export async function runLadder(
   const outcomes = {} as Record<StructureName, StructureOutcome>;
   const drop = (why: string): StructureOutcome => ({ probability: null, dropped: true, dropReason: why });
   const roundProbabilities: number[][] = [];   // [round0(workers), round1, ...] — D14 diagnostic
+  let aggregatorNumberLeaks = 0;              // D27 residual leak, counted below
 
   // ---- shared workers (rung 1 / rung 2 input / debate round 0)
   // allSettled: wait for ALL sibling calls so no record lands after we return.
@@ -162,7 +196,7 @@ export async function runLadder(
   const workerFail = firstFailure(workerSettled, 'worker');
   if (workerFail) {
     for (const s of STRUCTURES) outcomes[s] = drop(workerFail);
-    return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched: [], repetitionRuns: [] };
+    return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched: [], repetitionRuns: [], aggregatorNumberLeaks };
   }
   const workers = workerSettled.map(r => (r as PromiseFulfilledResult<LedgerCallResult>).value);
   roundProbabilities.push(workers.map(w => w.parsed.probability));   // round 0 = the shared workers
@@ -175,6 +209,10 @@ export async function runLadder(
   {
     const sub = withStructure(ledger, 'aggregator');
     try {
+      // Counted on the text actually handed to the aggregator, not on the
+      // template, because the template is exactly what looked correct before.
+      aggregatorNumberLeaks = workers
+        .filter(w => reasonStatesOwnNumber(w.parsed.reason, w.parsed.probability)).length;
       const r = await sub.call(llm, 'aggregator', aggregatorPrompt(ev, workers.map(w => w.parsed.reason)), {
         maxTokens: p.maxTokensPerCall, temperature: p.temperature, maxAttempts: p.maxParseAttempts,
       });
@@ -187,6 +225,7 @@ export async function runLadder(
   // ---- rung 3: debate, round 0 = workers, then R revision rounds with FULL answers
   {
     const sub = withStructure(ledger, 'debate');
+    const roundsBeforeDebate = roundProbabilities.length;   // == 1: round 0 is the shared workers
     let states = workers.map((w, i) => ({ agentId: String(i + 1), fullText: w.fullVisible, probability: w.parsed.probability }));
     let failed: string | null = null;
     for (let round = 1; round <= p.debateRounds && !failed; round++) {
@@ -206,6 +245,13 @@ export async function runLadder(
         roundProbabilities.push(states.map(s => s.probability));
       }
     }
+    // A debate that fails in round 2 has already pushed its round-1 vector.
+    // Left there, the convergence table (D14) averages each round column over a
+    // DIFFERENT set of events while reporting a single event count, and the
+    // event is meanwhile excluded from every other debate result because it is
+    // marked dropped. Rolling back to round 0 keeps the two consistent: a
+    // debate contributes rounds only if it finished them all.
+    if (failed) roundProbabilities.length = roundsBeforeDebate;
     outcomes.debate = failed
       ? drop(failed)
       : { probability: combine(states.map(s => s.probability), p.aggregate), dropped: false };
@@ -215,9 +261,27 @@ export async function runLadder(
   // their spend is known, so the communication-free rung is drawn up to the
   // largest of those budgets and each structure is paired with the prefix of
   // runs that fits its own.
-  const repetitionRuns = workers.map(w => ({
+  //
+  // What one logical call COST is every attempt it took, not just the attempt
+  // that happened to parse. A retry re-sends the whole prompt, and a truncated
+  // attempt burns the entire per-call cap before being thrown away; both are
+  // billed. Counting only the surviving attempt made whichever structure fails
+  // more often look cheaper than it was, and its compute-matched baseline was
+  // then drawn to that understated budget - the exact confound this matching
+  // exists to rule out. In one reproduction a debate that really spent 13,888
+  // tokens was compared against a baseline handed 5,056 (2.75x).
+  //
+  // It cuts both ways: the draw loop below used to skip an unusable extra run
+  // entirely, so the BASELINE got its retries for free and kept drawing. Both
+  // sides now pay for every attempt.
+  const billedFor = (structure: string, role: string) =>
+    ledger.records
+      .filter(r => r.structure === structure && r.agentRole === role)
+      .reduce((a, r) => a + r.totalTokens, 0);
+
+  const repetitionRuns = workers.map((w, i) => ({
     probability: w.parsed.probability,
-    totalTokens: w.record.totalTokens,
+    totalTokens: billedFor('workers', `worker_${i + 1}`),
   }));
   const matched: MatchedComparison[] = [];
   if (!outcomes.repetition.dropped) {
@@ -226,9 +290,11 @@ export async function runLadder(
     // which topology used the most tokens, and read tokens are real cost here
     // (communication cost is A + B, both read-side).
     const workerTokens = repetitionRuns.reduce((a, r) => a + r.totalTokens, 0);
+    // No `r.ok` filter: a discarded attempt was billed, so it is part of what
+    // this structure spent. See the note on billedFor above.
     const ownTokens = (s: StructureName) =>
       ledger.records
-        .filter(r => r.ok && r.structure === s)
+        .filter(r => r.structure === s)
         .reduce((a, r) => a + r.totalTokens, 0);
     const budgets = new Map<StructureName, number>();
     for (const s of STRUCTURES) {
@@ -262,16 +328,26 @@ export async function runLadder(
           MAX_EXTRA_RUNS - guard,
           MAX_BATCH,
         ));
+        const startIdx = repetitionRuns.length;
         const settled = await Promise.allSettled(
-          Array.from({ length: need }, (_, k) => drawOne(repetitionRuns.length + k + 1)),
+          Array.from({ length: need }, (_, k) => drawOne(startIdx + k + 1)),
         );
         guard += need;
         let anyOk = false;
-        for (const r of settled) {
-          if (r.status !== 'fulfilled') continue;   // malformed extra run: skip it
+        for (let k = 0; k < settled.length; k++) {
+          const billed = billedFor('repetition', `rep_${startIdx + k + 1}`);
+          const r = settled[k];
+          if (r.status !== 'fulfilled') {
+            // An extra run that produced nothing usable still cost money. Not
+            // charging for it let the baseline keep drawing on a budget it had
+            // already spent, which is the same bug as above with the sign
+            // flipped: it would hand the null hypothesis free compute.
+            spent += billed;
+            continue;
+          }
           anyOk = true;
-          repetitionRuns.push({ probability: r.value.parsed.probability, totalTokens: r.value.record.totalTokens });
-          spent += r.value.record.totalTokens;
+          repetitionRuns.push({ probability: r.value.parsed.probability, totalTokens: billed });
+          spent += billed;
         }
         if (!anyOk) break;   // nothing usable came back; report the shortfall
       }
@@ -298,7 +374,7 @@ export async function runLadder(
     }
   }
 
-  return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched, repetitionRuns };
+  return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched, repetitionRuns, aggregatorNumberLeaks };
 }
 
 /** Safety stop on the matching draw, so a cheap-run/expensive-structure ratio cannot loop away. */

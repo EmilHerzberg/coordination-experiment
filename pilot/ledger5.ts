@@ -68,6 +68,26 @@ export function splitTokens(segs: Segment[]): number[] {
     out.push(Math.max(0, now - prev));
     prev = now;
   }
+  // The whole point of this function is that the parts add up to the whole.
+  // The clamp above can break that: a cumulative token count is not strictly
+  // monotone (appending text can merge two tokens into one, so `now` may be
+  // BELOW `prev`), and clamping that difference to zero throws the deficit away
+  // instead of charging it to anyone. The total then exceeds localTokens(whole)
+  // and the read-side identity D + A + B + B_SELF = prompt_tokens drifts.
+  //
+  // The excess is taken back from the largest segments first, because that is
+  // where a merged token most plausibly came from and because it cannot push a
+  // small segment negative.
+  const total = prev;
+  let excess = out.reduce((a, b) => a + b, 0) - total;
+  while (excess > 0) {
+    let big = 0;
+    for (let i = 1; i < out.length; i++) if (out[i] > out[big]) big = i;
+    if (out[big] === 0) break;                 // nothing left to take
+    const take = Math.min(excess, out[big]);
+    out[big] -= take;
+    excess -= take;
+  }
   return out;
 }
 
@@ -335,7 +355,21 @@ export class Ledger5 {
           decisionLocal + restLocal + reasoningLocal,
           providerCompletion,
         )
-      : { ...rescale({ C1: decisionLocal, C2v: restLocal }, decisionLocal + restLocal, visibleBudget), C2h: providerReasoning };
+      : visibleBudget > 0
+        ? { ...rescale({ C1: decisionLocal, C2v: restLocal }, decisionLocal + restLocal, visibleBudget), C2h: providerReasoning }
+        // Providers sometimes report reasoning_tokens equal to (or above) the
+        // whole completion. Taken at face value that leaves no room for the
+        // visible answer, and the rescale above returned C1 = 0 for a call that
+        // demonstrably produced one - the final answer, the one thing RQ2 has to
+        // count, priced at nothing.
+        //
+        // Between the provider's reasoning count and text we can actually read,
+        // the text is the better evidence, so the whole completion is split by
+        // the visible parts and the hidden share is recorded as 0. That is
+        // certainly not right either, but it is wrong in a direction a reader
+        // can see: `visibleDiscrepancy` on such a call equals the entire visible
+        // length, and `maxVisibleDiscrepancy` carries it into the report.
+        : { ...rescale({ C1: decisionLocal, C2v: restLocal }, decisionLocal + restLocal, providerCompletion), C2h: 0 };
     const write: WriteSideCounts = {
       C1: w.C1,
       C2: w.C2v + w.C2h,
@@ -436,6 +470,21 @@ export interface StructureTotals {
   /** A + B + whole combiner call(s). B_SELF reported separately (open item). */
   commCost: number; commCostInclSelf: number;
   maxReadGap: number; maxWriteGap: number;
+  /**
+   * The same three totals AS BILLED, i.e. including the attempts that were
+   * discarded and retried.
+   *
+   * The five buckets above deliberately cover usable calls only - a malformed
+   * answer has no parseable decision, so there is no honest C1 to book. But the
+   * discarded attempt was still paid for, and leaving it out of the totals made
+   * the money and the token count disagree (one reproduction reported $0.0042
+   * against 920 tokens for a call that really cost 9,540). Whichever structure
+   * fails more often then looks cheaper than it was, which is precisely the
+   * confound compute matching exists to remove, so `structures5.ts` matches on
+   * these figures rather than on `total` / `commCost`.
+   */
+  billedPrompt: number; billedCompletion: number; billedTotal: number;
+  billedCommCost: number; billedCommCostInclSelf: number;
 }
 
 /**
@@ -450,9 +499,23 @@ export function summarize(records: CallLedgerRecord[], combinerRoles: string[] =
     calls: 0, malformedAttempts: 0, wastedTokens: 0, failFormat: 0, failTruncated: 0,
     retriedCalls: 0, maxAttemptUsed: 0, maxVisibleDiscrepancy: 0,
     commCost: 0, commCostInclSelf: 0, maxReadGap: 0, maxWriteGap: 0,
+    billedPrompt: 0, billedCompletion: 0, billedTotal: 0,
+    billedCommCost: 0, billedCommCostInclSelf: 0,
   };
   for (const r of records) {
     t.costUsd += r.costUsd;
+    // Billed first, for EVERY record. A discarded attempt re-sent the whole
+    // prompt and was charged for it; the read-side buckets are known for it too,
+    // because they are computed from the prompt rather than from the answer.
+    t.billedPrompt += r.read.providerPrompt;
+    t.billedCompletion += r.write.providerCompletion;
+    t.billedTotal += r.totalTokens;
+    {
+      const isCombinerBilled = combinerRoles.includes(r.agentRole);
+      const ownBilled = isCombinerBilled ? r.totalTokens : r.read.A + r.read.B;
+      t.billedCommCost += ownBilled;
+      t.billedCommCostInclSelf += ownBilled + (isCombinerBilled ? 0 : r.read.B_SELF);
+    }
     if (r.malformed) {
       t.malformedAttempts++;
       t.wastedTokens += r.totalTokens;
