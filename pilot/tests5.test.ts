@@ -8,6 +8,7 @@ import { parseTagged, stripThink, TaggedParseError } from './tagged.js';
 import { Ledger5, localTokens, summarize, splitTokens, MalformedCallError, type ProviderExtras } from './ledger5.js';
 import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
+import { buildStructureTokens } from './make-structure-tokens.js';
 
 // ------------------------------------------------------------------ mock
 type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number; finishReason?: string };
@@ -601,4 +602,56 @@ test('audit: a debate that drops leaves no partial rounds behind', async () => {
   assert.equal(res.outcomes.debate.dropped, true, 'the debate must be dropped');
   assert.equal(res.roundProbabilities.length, 1,
     'only round 0 (the shared workers) may survive a dropped debate');
+});
+
+// ---- structure-tokens emitter
+test('structure_tokens: combiner lines book the whole call, worker lines book A + B', async () => {
+  const llm = mockClient(() => ({ content: good(0.5, 'a reasoning section of a realistic length for this test') }));
+  const res = await runLadder(llm, EV, 'mock', { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  const rows = buildStructureTokens(res.ledger.records);
+  const line = (s: string) => rows.find(r => r.eventId === EV.id && r.modelKey === 'mock' && r.structure === s)!;
+
+  // The aggregator exists ONLY to combine other agents, so its entire call is
+  // communication cost (working doc §5.2) — the evidence it re-reads is not a
+  // cost a lone forecaster would ever have paid. Every other role contributes
+  // A + B, the coordination instruction plus the peer messages it read.
+  const aggCalls = res.ledger.records.filter(r => r.agentRole === 'aggregator');
+  assert.equal(aggCalls.length, 1, 'one aggregating call per event');
+  const aggWholeCall = aggCalls[0].totalTokens;
+  const aggAB = aggCalls[0].read.A + aggCalls[0].read.B;
+  // Without this the two rules would be indistinguishable and the test could
+  // not fail: it is the D evidence block that makes the whole call larger.
+  assert.ok(aggWholeCall > aggAB, 'the whole combiner call must exceed its own A + B');
+
+  const sumAB = (structures: string[]) => res.ledger.records
+    .filter(r => structures.includes(r.structure))
+    .reduce((a, r) => a + r.read.A + r.read.B, 0);
+
+  // repetition = the shared workers alone. They receive no coordination
+  // instruction and read no peer text, so A + B is 0 — that zero is what makes
+  // this rung the communication-free baseline the other two are measured against.
+  assert.equal(sumAB(['workers']), 0, 'workers must read no coordination text at all');
+  assert.equal(line('repetition').commCost, 0, 'a worker-only line carries A + B');
+
+  // aggregator = the same workers (A + B = 0) plus the whole combiner call.
+  assert.equal(line('aggregator').commCost, sumAB(['workers']) + aggWholeCall,
+    'the aggregator line carries the whole combiner call');
+
+  // debate = the same workers plus debaters, who are NOT combiners: real,
+  // non-zero A + B, so this is the branch the repetition line cannot exercise.
+  assert.ok(sumAB(['debate']) > 0, 'debaters must actually read peer messages');
+  assert.equal(line('debate').commCost, sumAB(['workers', 'debate']),
+    'a non-combiner line carries A + B even when A + B is large');
+
+  // Second event, same model, one ledger. `structureRecords` filters on the
+  // structure field alone, so if the emitter did not narrow to one event first
+  // it would fold E2's shared workers into E1's totals. The result would still
+  // be internally consistent and would still satisfy every identity above —
+  // just roughly twice the true cost.
+  const res2 = await runLadder(llm, { id: 'E2', text: EV.text }, 'mock',
+    { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' });
+  const both = buildStructureTokens([...res.ledger.records, ...res2.ledger.records]);
+  assert.equal(both.length, 6, 'two events x one model x three structures');
+  assert.deepEqual(both.find(r => r.eventId === EV.id && r.structure === 'aggregator'), line('aggregator'),
+    'a second event must not change the first event numbers');
 });
