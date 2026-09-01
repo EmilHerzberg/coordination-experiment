@@ -9,6 +9,17 @@ import { Ledger5, localTokens, summarize, splitTokens, MalformedCallError, type 
 import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 import { buildStructureTokens } from './make-structure-tokens.js';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import {
+  run, planWork, completedKeys, purgeOrphans, purgeFile, taskKey, outputPaths, ledgerKeyOf,
+  rawKeyOf, wantsFresh, isPidAlive, acquireLock, readLockInfo,
+  encodeModelKey, decodeModelKey, overheadPathFor, readOverhead,
+  type ModelSpec, type LadderClient, type RunOptions, type PurgeIO,
+} from './run-pilot5.js';
+import { CostCapError } from './openrouter-client.js';
 
 // ------------------------------------------------------------------ mock
 type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number; finishReason?: string };
@@ -183,6 +194,55 @@ test('runLadder: a malformed worker drops all three structures, aggregator failu
 });
 
 // ---------------------------------------------------------------- report
+// FINDING 1 (2026-09-01). The taxonomy the thesis quotes (make-report5.ts D16:
+// "Infrastructure errors ... never appear here; the client retries them itself")
+// was not what the code did: EVERY rejection became a `dropped` outcome and
+// runLadder returned normally, so run-pilot5 wrote an outcomes line — the very
+// marker resume reads as "done". A provider outage was therefore recorded as a
+// model failure AND made permanent. Reproduced before the fix: one injected
+// ECONNRESET on worker_2 left the event on disk with all three rungs
+// dropped=true and 2 ledger records, and the resume said completed=0 skipped=2.
+test('runLadder: a malformed answer is a result (drop), an outage is not (it propagates)', async () => {
+  const P = { agentCount: 3, debateRounds: 1, temperature: 0.7, aggregate: 'mean' as const };
+  const failingAt = (role: string, err: () => Error) => mockClient(req => {
+    if ((req.metadata?.agentRole ?? '') === role || role === 'rep_*' && (req.metadata?.agentRole ?? '').startsWith('rep_')) throw err();
+    return { content: good(0.4) };
+  });
+  const net = () => new Error('fetch failed: ECONNRESET after 4 attempts');
+
+  // All three rungs, plus the compute-matching draws — every place a rejection
+  // used to be swallowed. `rep_*` covers the extra baseline runs, where an
+  // outage does not even produce a drop: it silently SHORTENS the
+  // communication-free baseline (measured: debate compared against 945 of
+  // 3,948 tokens instead of 3,765, a 4x understated null hypothesis).
+  for (const role of ['worker_2', 'aggregator', 'debater_2', 'rep_*']) {
+    await assert.rejects(
+      () => runLadder(failingAt(role, net), EV, 'mock', P),
+      /ECONNRESET/,
+      `an outage at ${role} must reach the caller, not be booked as a drop`,
+    );
+  }
+  // The cost cap must keep its IDENTITY across the ladder: run-pilot5 stops the
+  // whole session on `instanceof CostCapError`, which a re-wrapped message
+  // (`aggregator error: ...`, as before) silently defeated.
+  await assert.rejects(
+    () => runLadder(failingAt('aggregator', () => new CostCapError('cost cap $2.0 reached')), EV, 'mock', P),
+    (e: unknown) => e instanceof CostCapError,
+    'CostCapError must arrive as itself',
+  );
+
+  // And the other half of the distinction: a MALFORMED answer is still a
+  // result. It drops its structure, keeps the others, and returns normally.
+  const malformed = mockClient(req => ({
+    content: (req.metadata?.agentRole ?? '') === 'aggregator' ? 'no tags at all' : good(0.4),
+  }));
+  const res = await runLadder(malformed, EV, 'mock', P);
+  assert.equal(res.outcomes.aggregator.dropped, true);
+  assert.match(res.outcomes.aggregator.dropReason!, /unusable after 2 attempts/);
+  assert.equal(res.outcomes.repetition.dropped, false);
+  assert.equal(res.outcomes.debate.dropped, false);
+});
+
 test('buildReport: sanity rows all ok on a clean mock run', async () => {
   const { buildReport } = await import('./make-report5.js');
   const llm = mockClient(req => ({ content: good(0.5, `${req.metadata?.agentRole} reasoning text here.`), reasoningTokens: 20 }));
@@ -654,4 +714,783 @@ test('structure_tokens: combiner lines book the whole call, worker lines book A 
   assert.equal(both.length, 6, 'two events x one model x three structures');
   assert.deepEqual(both.find(r => r.eventId === EV.id && r.structure === 'aggregator'), line('aggregator'),
     'a second event must not change the first event numbers');
+});
+
+// ==========================================================================
+// RESUME / LEVEL-PREFIX / SELF-REPORTING  (run-pilot5.ts)
+//
+// The real run is 800 events x 2 models x 2 evidence levels = 3,200 ladder
+// runs, ~$31.50 and ~1.7 days of wall clock at concurrency 6. Over that span a
+// sleep, a network blip, a provider outage or a Ctrl-C is a certainty, so the
+// behaviour under interruption is a property of the instrument, not an edge
+// case. These tests pin it down. None of them touches the network: the ladder
+// is driven by the same mock client as everything above.
+// ==========================================================================
+
+/** Scratch root. NEVER pilot5/ — that holds the committed pilot data. */
+const SCRATCH = process.env.PILOT5_TEST_OUTDIR ?? tmpdir();
+const scratchDir = (label: string) => mkdtempSync(join(SCRATCH, `pilot5-${label}-`));
+
+/** A model spec whose slug and provider are never used, because the client is injected. */
+const MOCK_MODEL: ModelSpec = {
+  key: 'mock', slug: 'mock/mock', provider: 'mock', mode: 'none',
+  arm: 'non-reasoning', evidence: 'all', priceIn: 0, priceOut: 0,
+};
+
+/**
+ * A client the runner can drive: the mock generator above plus the two things
+ * `run()` needs from a real OpenRouterClient — `beginStructureRun`, and the
+ * raw request log it writes itself. The raw log matters here because
+ * `runs_raw.jsonl` has to be purged on resume exactly like the ledger, and it
+ * names its key fields `evidence_id` / `model_key`, not `eventId` / `modelKey`.
+ */
+function mockLadderClient(
+  rawPath: string,
+  modelKey = 'mock',
+  /** Optional outage injector: return an Error to make THIS call fail. */
+  failOn: (evidenceId: string, agentRole: string) => Error | null = () => null,
+): LadderClient {
+  let evidenceId: string | undefined;
+  let n = 0;
+  const inner = mockClient(req => ({
+    // Distinct text per call: identical answers at temperature > 0 are the
+    // D24 request-collapsing failure, and the report checks for exactly that.
+    content: good(0.4 + (n % 5) / 100, `${req.metadata?.agentRole ?? 'x'} reasoning number ${n} of a realistic length.`),
+  }));
+  return {
+    beginStructureRun(_configName: string, evId: string) { evidenceId = evId; },
+    async generate(req: GenerateRequest) {
+      n++;
+      const boom = failOn(evidenceId ?? '', req.metadata?.agentRole ?? '');
+      if (boom) throw boom;
+      const res = await inner.generate(req);
+      appendFileSync(rawPath, JSON.stringify({
+        ok: true, evidence_id: evidenceId, model_key: modelKey,
+        agent_role: req.metadata?.agentRole ?? null, call: n,
+      }) + '\n');
+      return res;
+    },
+  };
+}
+
+const EVENTS = [
+  { id: 'AAPL_2024Q1_L1', text: 'FICTIONAL COMPANY A reported revenue of $1B, up 10%.' },
+  { id: 'MSFT_2024Q1_L1', text: 'FICTIONAL COMPANY B reported revenue of $2B, down 4%.' },
+];
+
+const runMock = (dir: string, opts: Partial<RunOptions> = {}) =>
+  run(['mock'], null, {
+    outDir: dir, level: 1, mode: 'full', concurrency: 2, repeats: 1,
+    events: EVENTS, models: [MOCK_MODEL], packs: [],
+    makeClient: () => mockLadderClient(outputPaths(dir, opts.level ?? 1, opts.mode ?? 'full').raw),
+    ...opts,
+  });
+
+const lines = (p: string) => (existsSync(p) ? readFileSync(p, 'utf-8').split(/\r?\n/).filter(Boolean) : []);
+
+// ---- 1. completedKeys
+test('resume: completedKeys treats level and repeat as part of the key', () => {
+  const keys = completedKeys([
+    JSON.stringify({ modelKey: 'qwen3-32b@on', eventId: 'AAPL_2024Q1_L1' }),
+    JSON.stringify({ modelKey: 'qwen3-32b@on', eventId: 'AAPL_2024Q1_L2' }),
+    JSON.stringify({ modelKey: 'qwen3-32b@on', eventId: 'AAPL_2024Q1_L1#r2' }),
+    JSON.stringify({ modelKey: 'deepseek-chat-v3-0324', eventId: 'AAPL_2024Q1_L1' }),
+    '',                                    // trailing newline of an appended file
+    '{"modelKey":"qwen3-32b@on","eventId"',  // a kill mid-append: torn last line
+  ]);
+  // 4 well-formed lines, and NOT ONE of them may collapse into another. The
+  // level suffix (_L2) and the repeat suffix (#r2) are the whole reason the
+  // pair (eventId, modelKey) is a complete natural key.
+  assert.equal(keys.size, 4);
+  assert.ok(keys.has(taskKey('AAPL_2024Q1_L1', 'qwen3-32b@on')));
+  assert.ok(keys.has(taskKey('AAPL_2024Q1_L2', 'qwen3-32b@on')));
+  assert.ok(keys.has(taskKey('AAPL_2024Q1_L1#r2', 'qwen3-32b@on')));
+  assert.ok(keys.has(taskKey('AAPL_2024Q1_L1', 'deepseek-chat-v3-0324')));
+  // The torn line is not completed work. Counting it would skip an event that
+  // never produced an outcome, i.e. silently lose it from the dataset.
+  assert.equal([...keys].filter(k => k.includes('AAPL_2024Q1_L1')).length, 3);
+});
+
+// ---- 2. planWork
+test('resume: planWork skips exactly the done tasks and keeps the rest in order', () => {
+  const mk = (key: string, id: string) => ({ m: { key }, ev: { id } });
+  const tasks = [
+    mk('qwen', 'E1'), mk('qwen', 'E2'), mk('qwen', 'E3'),
+    mk('deepseek', 'E1'), mk('deepseek', 'E2'), mk('deepseek', 'E3'),
+  ];
+  const done = new Set([taskKey('E2', 'qwen'), taskKey('E1', 'deepseek'), taskKey('E3', 'deepseek')]);
+  const { todo, skipped } = planWork(tasks, done);
+
+  assert.deepEqual(todo.map(t => `${t.ev.id}/${t.m.key}`), ['E1/qwen', 'E3/qwen', 'E2/deepseek']);
+  assert.deepEqual(skipped.map(t => `${t.ev.id}/${t.m.key}`), ['E2/qwen', 'E1/deepseek', 'E3/deepseek']);
+  assert.equal(todo.length + skipped.length, tasks.length, 'no task may be lost or duplicated');
+  // Same event id under a different model is a DIFFERENT run. If the key were
+  // the event alone, E1/qwen would be skipped because E1/deepseek is done.
+  assert.ok(todo.some(t => t.ev.id === 'E1' && t.m.key === 'qwen'));
+});
+
+// ---- 3. purgeOrphans
+test('resume: purgeOrphans drops a half-run and keeps every record of a finished one', () => {
+  // E1 finished (5 records). E2 was killed after 3 of its records were written
+  // and before its outcomes line, so it has NO outcomes line.
+  const records = [
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'worker_1' },
+    { eventId: 'E2', modelKey: 'mock', agentRole: 'worker_1' },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'worker_2' },
+    { eventId: 'E2', modelKey: 'mock', agentRole: 'worker_2' },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'worker_3' },
+    { eventId: 'E2', modelKey: 'mock', agentRole: 'aggregator' },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'aggregator' },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'debater_1' },
+    // Same event id, other model: finished there, so it must survive.
+    { eventId: 'E2', modelKey: 'other', agentRole: 'worker_1' },
+  ];
+  const done = new Set([taskKey('E1', 'mock'), taskKey('E2', 'other')]);
+  const { kept, removed } = purgeOrphans(records, done);
+
+  // The counts are chosen so a no-op (`kept = records, removed = []`) gives
+  // 9/0 and a purge-everything gives 0/9: neither can pass by accident, and
+  // neither matches on length alone.
+  assert.equal(removed.length, 3);
+  assert.equal(kept.length, 6);
+  assert.equal(kept.length + removed.length, records.length);
+  assert.ok(removed.every(r => r.eventId === 'E2' && r.modelKey === 'mock'));
+  assert.equal(kept.filter(r => r.eventId === 'E1').length, 5, 'a finished event keeps ALL its records');
+  assert.equal(kept.filter(r => r.modelKey === 'other').length, 1, 'the other model finished E2 and is untouched');
+
+  // The raw log names the same two fields differently, and the calibration
+  // probe is logged before any event begins — no evidence_id at all. That
+  // record belongs to no event, so it cannot be double-counted and is kept.
+  const raw = [
+    { evidence_id: 'E1', model_key: 'mock' },
+    { evidence_id: 'E2', model_key: 'mock' },
+    { model_key: 'mock' },
+  ];
+  const r2 = purgeOrphans(raw, done, rawKeyOf);
+  assert.equal(r2.removed.length, 1);
+  assert.equal(r2.kept.length, 2);
+});
+
+// ---- 4. the property that matters most: a finished run is a no-op
+test('resume: re-running a finished run does nothing and leaves the files byte-identical', async () => {
+  const dir = scratchDir('noop');
+  const P = outputPaths(dir, 1);
+  const first = await runMock(dir);
+  assert.equal(first.completed, 2);
+  assert.equal(first.skipped, 0);
+
+  const before = [P.ledger, P.outcomes, P.raw].map(p => readFileSync(p));
+  const second = await runMock(dir);
+
+  assert.equal(second.completed, 0, 'not one paid call may be repeated');
+  assert.equal(second.skipped, 2);
+  assert.equal(second.purgedLedger, 0);
+  assert.equal(second.purgedRaw, 0);
+  // Bytes, not counts: a purge that re-serialised the survivors, or an append
+  // of a re-ordered duplicate, would keep every count identical.
+  const after = [P.ledger, P.outcomes, P.raw].map(p => readFileSync(p));
+  for (let i = 0; i < before.length; i++) {
+    assert.ok(before[i].equals(after[i]), `${[P.ledger, P.outcomes, P.raw][i]} changed on a no-op resume`);
+  }
+  // The status file is the ONE file that must grow: it is the record of how
+  // often the run was interrupted, which is worthless if it is overwritten.
+  assert.equal(lines(P.status).filter(l => l.startsWith('=== FULL session')).length, 2);
+});
+
+// ---- 5. resume after a crash: the event must appear exactly ONCE
+test('resume: orphan records from a killed run are purged, so no event is counted twice', async () => {
+  const dir = scratchDir('crash');
+  const P = outputPaths(dir, 1);
+
+  // A clean run of event 1 only — this is the reference shape.
+  await runMock(dir, { events: [EVENTS[0]] });
+  const cleanCount = lines(P.ledger).length;
+  assert.ok(cleanCount > 5, `a ladder run writes many records, got ${cleanCount}`);
+
+  // Now simulate SIGKILL in the window between the ledger append loop and the
+  // outcomes append: some of event 2's records are on disk, its outcomes line
+  // is not. Same for the raw log.
+  const orphans = lines(P.ledger).slice(0, 4)
+    .map(l => { const r = JSON.parse(l); r.eventId = EVENTS[1].id; return JSON.stringify(r); });
+  appendFileSync(P.ledger, orphans.join('\n') + '\n');
+  appendFileSync(P.raw, JSON.stringify({ ok: true, evidence_id: EVENTS[1].id, model_key: 'mock' }) + '\n');
+  // The kill also caught the outcomes append mid-write. Note there is no
+  // trailing newline: the next append would glue itself onto this fragment.
+  appendFileSync(P.outcomes, '{"modelKey":"mock","eventId"');
+  assert.equal(lines(P.ledger).length, cleanCount + 4);
+
+  const res = await runMock(dir);   // both events; event 1 is done, event 2 is not
+  assert.equal(res.skipped, 1);
+  assert.equal(res.completed, 1);
+  assert.equal(res.purgedLedger, 4, 'the four orphan ledger records must be removed');
+  assert.equal(res.purgedRaw, 1);
+
+  // Count records PER (eventId, modelKey). This is the assertion that catches
+  // the double count: 4 stale records plus a full re-run still satisfies every
+  // token identity (D+A+B+B_SELF = prompt, C1+C2 = completion) and every
+  // sanity row in the report, while inflating the event's cost by ~40 %.
+  const perKey = new Map<string, number>();
+  for (const l of lines(P.ledger)) {
+    const r = JSON.parse(l);
+    perKey.set(taskKey(r.eventId, r.modelKey), (perKey.get(taskKey(r.eventId, r.modelKey)) ?? 0) + 1);
+  }
+  assert.equal(perKey.get(taskKey(EVENTS[0].id, 'mock')), cleanCount);
+  assert.equal(perKey.get(taskKey(EVENTS[1].id, 'mock')), cleanCount,
+    'event 2 must appear exactly once — the same record count as a clean run');
+  assert.equal(lines(P.outcomes).length, 2, 'one outcomes line per event, never two');
+  // The torn fragment is gone rather than fused with the line appended after
+  // it — which would have taken the artefact builders down at the very end of
+  // a 1.7-day run, over half a line.
+  for (const l of lines(P.outcomes)) JSON.parse(l);
+  assert.deepEqual(lines(P.outcomes).map(l => JSON.parse(l).eventId), [EVENTS[0].id, EVENTS[1].id]);
+});
+
+// ---- 6. --fresh
+test('resume: --fresh truncates, and the status line says so', async () => {
+  const dir = scratchDir('fresh');
+  const P = outputPaths(dir, 1);
+  await runMock(dir);
+  assert.equal(lines(P.outcomes).length, 2);
+
+  const res = await runMock(dir, { fresh: true, events: [EVENTS[0]] });
+  assert.equal(res.skipped, 0, '--fresh must not resume anything');
+  assert.equal(res.completed, 1);
+  // Only the one event of the fresh run survives: the other event's records
+  // were thrown away rather than resumed.
+  assert.equal(lines(P.outcomes).length, 1);
+  assert.equal(JSON.parse(lines(P.outcomes)[0]).eventId, EVENTS[0].id);
+  assert.ok(lines(P.ledger).every(l => JSON.parse(l).eventId === EVENTS[0].id));
+
+  const said = lines(P.status).find(l => l.includes('--fresh'));
+  assert.ok(said, 'a run that destroys work must say so on the status line');
+  assert.ok(/TRUNCATED/.test(said!), `status line must name the act, got: ${said}`);
+  assert.ok(/2 completed ladder runs discarded/.test(said!), `status line must say what it cost, got: ${said}`);
+});
+
+// ---- 7. level separation
+test('resume: an L1 run never touches L2 files, and vice versa', async () => {
+  const dir = scratchDir('levels');
+  const P1 = outputPaths(dir, 1), P2 = outputPaths(dir, 2);
+  await runMock(dir, { level: 1 });
+
+  for (const p of [P2.ledger, P2.outcomes, P2.raw, P2.status, P2.report, P2.structureTokens]) {
+    assert.ok(!existsSync(p), `an L1 run wrote ${p}`);
+  }
+  // The pre-prefix scheme wrote `ledger5.jsonl` and relied on the operator
+  // renaming it afterwards. No unprefixed run output may exist any more.
+  for (const stale of ['ledger5.jsonl', 'outcomes.jsonl', 'runs_raw.jsonl', 'run_status.txt', 'ledger_report_v2.md', 'transcript.md']) {
+    assert.ok(!existsSync(join(dir, stale)), `unprefixed ${stale} was left behind`);
+  }
+
+  const l1Before = readFileSync(P1.ledger);
+  await runMock(dir, { level: 2, events: EVENTS.map(e => ({ ...e, id: e.id.replace('_L1', '_L2') })) });
+  assert.ok(readFileSync(P1.ledger).equals(l1Before), 'the L2 run modified the L1 ledger');
+  assert.ok(existsSync(P2.ledger));
+  assert.ok(lines(P2.ledger).every(l => JSON.parse(l).eventId.endsWith('_L2')));
+  // The calibration cache is the one deliberately SHARED thing: a per-model
+  // measurement, not run output, so the cheap probe is paid for once. It is one
+  // file PER MODEL now — a single shared object could not survive two sessions.
+  assert.ok(existsSync(overheadPathFor(dir, 'mock')));
+  assert.ok(!existsSync(join(dir, 'template_overhead.json')),
+    'the clobberable single-object cache is back');
+});
+
+// ---- 8. the four artefacts
+test('resume: a full run generates the four artefacts under its own level prefix', async () => {
+  const dir = scratchDir('artefacts');
+  const P = outputPaths(dir, 2);
+  const res = await runMock(dir, { level: 2 });
+  assert.equal(res.artefactsOk, true);
+
+  for (const p of [P.report, P.transcript, P.transcriptFull, P.structureTokens]) {
+    assert.ok(existsSync(p), `missing artefact ${p}`);
+    assert.ok(readFileSync(p, 'utf-8').length > 100, `${p} is empty`);
+  }
+  // The L2 run of 2026-08-28 has transcripts but no report, because generating
+  // it was a separate manual command and the step was forgotten.
+  assert.ok(readFileSync(P.report, 'utf-8').includes('five-bucket token accounting'));
+  // The summary must describe THIS ledger: its provenance header carries the
+  // hash of the file it was built from.
+  const meta = JSON.parse(lines(P.structureTokens)[0])._meta;
+  assert.equal(meta.ledgerPath, P.ledger);
+  assert.equal(meta.ledgerSha256, createHash('sha256').update(readFileSync(P.ledger)).digest('hex'));
+  assert.equal(meta.ledgerLines, lines(P.ledger).length);
+  // 2 events x 1 model x 3 structures, and every event that ran is present.
+  assert.equal(lines(P.structureTokens).length - 1, 6);
+});
+
+// ---- 9. a builder failure costs the artefact, never the run
+test('resume: a failing report builder does not fail the run, but is not silent either', async () => {
+  const dir = scratchDir('builderfail');
+  const P = outputPaths(dir, 1);
+  // A pack whose ground-truth field blows up when the transcript builder reads
+  // it. What breaks does not matter; that the ladder runs are untouched by it
+  // does — they already cost real money and are already on disk.
+  const boom = [{ id: 'AAPL_2024Q1', symbol: 'AAPL', reportDate: '2024-01-01', t0: '2024-01-01', label: 1,
+    get abnormalReturn(): number { throw new Error('simulated builder failure'); } }];
+  const res = await runMock(dir, { packs: boom as any });
+
+  assert.equal(res.completed, 2, 'the expensive part succeeded and must be reported as such');
+  assert.equal(res.artefactsOk, false, 'a broken artefact must not pass unnoticed');
+  assert.equal(lines(P.ledger).length > 0, true, 'the ledger is on disk regardless');
+  assert.equal(lines(P.outcomes).length, 2);
+  // The other three artefacts are still produced: one builder throwing must not
+  // cost the author the rest.
+  assert.ok(existsSync(P.report));
+  assert.ok(existsSync(P.structureTokens));
+  assert.ok(!existsSync(P.transcript), 'the transcript is the one that failed here');
+  assert.ok(!existsSync(P.transcriptFull));
+  assert.ok(lines(P.status).some(l => l.startsWith('[report] FAILED')),
+    'the failure has to be on the status line, in words');
+
+  // And it is genuinely resumable afterwards: nothing was lost.
+  const again = await runMock(dir);
+  assert.equal(again.completed, 0);
+  assert.equal(again.skipped, 2);
+});
+
+// ---- 10. FINDING 1 end to end: an outage leaves the event to be retried
+test('resume: a provider outage writes no outcomes line, and the resume re-runs exactly that event', async () => {
+  const dir = scratchDir('outage');
+  const P = outputPaths(dir, 1);
+  const outage = (ev: string, role: string) =>
+    ev === EVENTS[1].id && role === 'aggregator' ? new Error('fetch failed: ECONNRESET after 4 attempts') : null;
+
+  const first = await runMock(dir, { makeClient: () => mockLadderClient(P.raw, 'mock', outage) });
+  assert.equal(first.completed, 1, 'the healthy event completes');
+  // THE assertion: nothing at all was banked for the broken event — no outcomes
+  // line, so it is not done, and no ledger records, so nothing to purge either.
+  assert.deepEqual(lines(P.outcomes).map(l => JSON.parse(l).eventId), [EVENTS[0].id]);
+  assert.ok(!lines(P.ledger).some(l => JSON.parse(l).eventId === EVENTS[1].id));
+  // The failure taxonomy must stay clean: an outage may not appear as a drop.
+  assert.equal(first.dropped, 0);
+  for (const l of lines(P.outcomes)) assert.ok(!/ECONNRESET/.test(l), 'an outage was recorded as a scientific result');
+  // ... and it has to SAY so, or a wall of FAILs at 3am reads like lost data.
+  const said = lines(P.status).find(l => l.includes('FAIL'));
+  assert.ok(said && /retried on the next resume/.test(said), `status line must say the event is not lost, got: ${said}`);
+
+  // The provider comes back: the resume runs exactly the missing event.
+  const clean = await runMock(dir, { events: [EVENTS[0]] });   // reference shape
+  const perEvent = new Map<string, number>();
+  const again = await runMock(dir);
+  assert.equal(again.skipped, 1);
+  assert.equal(again.completed, 1);
+  for (const l of lines(P.ledger)) {
+    const r = JSON.parse(l);
+    perEvent.set(r.eventId, (perEvent.get(r.eventId) ?? 0) + 1);
+  }
+  assert.equal(perEvent.get(EVENTS[0].id), perEvent.get(EVENTS[1].id),
+    'the retried event must end up with the same record count as a clean one');
+  assert.deepEqual(lines(P.outcomes).map(l => JSON.parse(l).eventId), [EVENTS[0].id, EVENTS[1].id]);
+  assert.equal(clean.completed, 0, 'the reference run found event 1 already done');
+});
+
+// ---- 11. FINDING 2: a probe may not touch the authoritative files
+test('probe: a smoke test writes probe_L1_* only, and never contaminates what full trusts', async () => {
+  const dir = scratchDir('probe');
+  const A = outputPaths(dir, 1);              // authoritative — what `full` reads
+  const B = outputPaths(dir, 1, 'probe');     // the probe's own files
+  assert.notEqual(A.ledger, B.ledger, 'probe and full must not share a path');
+
+  // Two probe runs on ONE event. Before the fix this left the AUTHORITATIVE
+  // files with 2 outcomes lines and 40 ledger records where one honest pass
+  // writes 20, and the next `full` reported "resuming: 1 of 2 done".
+  await runMock(dir, { mode: 'probe', events: [EVENTS[0]] });
+  await runMock(dir, { mode: 'probe', events: [EVENTS[0]] });
+  for (const p of [A.ledger, A.outcomes, A.raw, A.status, A.report]) {
+    assert.ok(!existsSync(p), `a probe wrote the authoritative ${p}`);
+  }
+  // The probe's own files show ONE pass, not the sum of the last two runs.
+  assert.equal(lines(B.outcomes).length, 1);
+  const probeRecords = lines(B.ledger).length;
+  assert.ok(lines(B.status).some(l => l.includes(B.prefix)),
+    'the status line must say where the probe wrote');
+
+  // `full` now finds nothing done and plans every event.
+  const res = await runMock(dir);
+  assert.equal(res.planned, 2);
+  assert.equal(res.skipped, 0, 'a probe must never make an event look complete');
+  assert.equal(res.completed, 2);
+  const perEvent = new Map<string, number>();
+  for (const l of lines(A.ledger)) {
+    const r = JSON.parse(l);
+    perEvent.set(r.eventId, (perEvent.get(r.eventId) ?? 0) + 1);
+  }
+  assert.equal(perEvent.size, 2);
+  assert.equal(perEvent.get(EVENTS[0].id), probeRecords, 'one honest pass, not two');
+  assert.equal(perEvent.get(EVENTS[1].id), probeRecords);
+  assert.equal(lines(A.outcomes).length, 2);
+});
+
+// ---- 12. FINDING 3: one writer per level
+test('lock: a second session on the same level refuses to start, and says how to clear it', async () => {
+  const dir = scratchDir('lock');
+  const P = outputPaths(dir, 1);
+  // `run` takes the lock synchronously before its first await, so this is a
+  // real overlap and not a timing race: A is mid-session when B starts.
+  const a = runMock(dir);
+  const b = runMock(dir).then(() => 'RAN').catch((e: Error) => e.message);
+  const [ra, rb] = await Promise.all([a, b]);
+
+  assert.equal(ra.completed, 2, 'the session that holds the lock runs normally');
+  assert.notEqual(rb, 'RAN', 'two sessions ran against one level');
+  assert.match(rb as string, /another session holds/);
+  // A crashed run must be recoverable BY THE OPERATOR, so the message has to
+  // name the file to delete — refusing without a way out is its own outage.
+  assert.match(rb as string, /rm "/);
+  assert.match(rb as string, /L1_run\.lock/);
+  assert.ok(lines(P.status).some(l => l.includes('REFUSING TO START')));
+
+  // Exactly one pass per event, and the lock is gone afterwards.
+  assert.equal(lines(P.outcomes).length, 2);
+  assert.ok(!existsSync(P.lock), 'the lock outlived the session that held it');
+});
+
+test('lock: a killed session leaves a STALE lock that clears itself, loudly', async () => {
+  const dir = scratchDir('stalelock');
+  const P = outputPaths(dir, 1);
+  // What a SIGKILL leaves behind: a lock naming a pid that no longer exists.
+  // Blocking the restart on it would make a crashed run unrecoverable — the
+  // opposite of the point, on a 1.7-day run where a kill is a certainty.
+  const deadPid = 999999;
+  assert.equal(isPidAlive(deadPid), false, 'the test needs a pid that is really gone');
+  writeFileSync(P.lock, JSON.stringify({
+    pid: deadPid, host: hostname(), started: '2026-09-01T00:00:00.000Z', mode: 'full', level: 1,
+  }) + '\n');
+
+  const res = await runMock(dir);
+  assert.equal(res.completed, 2, 'a stale lock must not block the restart');
+  const said = lines(P.status).find(l => l.includes('STALE LOCK'));
+  assert.ok(said, 'clearing another session\'s lock file may not be silent');
+  assert.match(said!, new RegExp(String(deadPid)), 'the line must name the pid it decided was dead');
+  assert.ok(!existsSync(P.lock));
+});
+
+test('lock: a lock that cannot be read is not adjudicated, and the pid check is honest', async () => {
+  const dir = scratchDir('badlock');
+  const P = outputPaths(dir, 1);
+  writeFileSync(P.lock, 'this is not json\n');
+  // Something wrote it; "I cannot read it" is not evidence that it is dead.
+  await assert.rejects(() => runMock(dir), /another session holds/);
+  assert.ok(existsSync(P.lock), 'an unreadable lock must not be silently discarded');
+  assert.equal(lines(P.outcomes).length, 0, 'not one call may be made while refused');
+
+  // The operator does what the message says.
+  const fs = await import('node:fs');
+  fs.unlinkSync(P.lock);
+  assert.equal((await runMock(dir)).completed, 2);
+
+  // isPidAlive is the whole basis of the stale/live decision, so pin both ends.
+  assert.equal(isPidAlive(process.pid), true);
+  assert.equal(isPidAlive(0), false);
+  assert.equal(isPidAlive(-1), false);
+  assert.equal(isPidAlive(999999), false);
+});
+
+test('lock: a session that throws still releases the lock', async () => {
+  const dir = scratchDir('lockthrow');
+  const P = outputPaths(dir, 1);
+  // A corrupt legacy calibration cache makes the migration — and so run() —
+  // throw AFTER the lock is taken. Whatever the failure, leaving the lock
+  // behind would block every restart of a level that is otherwise perfectly
+  // resumable.
+  writeFileSync(P.overheadLegacy, '{ not json');
+  await assert.rejects(() => runMock(dir));
+  assert.ok(!existsSync(P.lock), 'the lock survived a failed session and would block the restart');
+
+  writeFileSync(P.overheadLegacy, '{}');
+  assert.equal((await runMock(dir)).completed, 2);
+});
+
+// ---- 13. FINDING 4: the purge is atomic, and now something checks it
+test('purge: a crash between the temp write and the rename leaves the original file complete', async () => {
+  const dir = scratchDir('purgeatomic');
+  const path = join(dir, 'L1_ledger5.jsonl');
+  // E1 is done, E2 is a half-run — so the purge really does rewrite the file.
+  const rows = [
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'worker_1', totalTokens: 111 },
+    { eventId: 'E2', modelKey: 'mock', agentRole: 'worker_1', totalTokens: 222 },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'worker_2', totalTokens: 333 },
+    { eventId: 'E2', modelKey: 'mock', agentRole: 'worker_2', totalTokens: 444 },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'aggregator', totalTokens: 555 },
+    { eventId: 'E1', modelKey: 'mock', agentRole: 'debater_1', totalTokens: 666 },
+  ];
+  writeFileSync(path, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const done = new Set([taskKey('E1', 'mock')]);
+  const before = readFileSync(path);
+  const intact = (why: string) => {
+    assert.ok(readFileSync(path).equals(before), why);
+    assert.equal(lines(path).length, rows.length, why);
+    for (const l of lines(path)) JSON.parse(l);          // every line still whole
+    assert.ok(!existsSync(`${path}.purge.tmp`), 'a fragment was left behind');
+  };
+
+  // (a) the write dies halfway — the ENOSPC / power-cut case the comment on
+  // purgeFile claims to survive. Nothing had ever exercised it: a mutant that
+  // wrote the survivors straight back over `path` passed all 43 tests.
+  const written: string[] = [];
+  const halfWrite: PurgeIO = {
+    write: (p, d) => {
+      written.push(p);
+      writeFileSync(p, d.slice(0, Math.max(1, Math.floor(d.length / 2))));   // torn
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    },
+    rename: () => assert.fail('rename must not run after a failed write'),
+  };
+  assert.throws(() => purgeFile(path, done, ledgerKeyOf, halfWrite), /ENOSPC/);
+  intact('a failed WRITE damaged the original ledger');
+  assert.ok(written[0].endsWith('.purge.tmp'),
+    `the purge wrote to ${written[0]}, i.e. straight over the file it was cleaning`);
+
+  // (b) the write succeeds and the RENAME dies (EPERM: another handle on the
+  // file, routine on Windows). Same requirement.
+  const failRename: PurgeIO = {
+    write: (p, d) => writeFileSync(p, d),
+    rename: () => { throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' }); },
+  };
+  assert.throws(() => purgeFile(path, done, ledgerKeyOf, failRename), /EPERM/);
+  intact('a failed RENAME damaged the original ledger');
+
+  // And with no failure injected it still does its job.
+  assert.equal(purgeFile(path, done, ledgerKeyOf), 2);
+  assert.deepEqual(lines(path).map(l => JSON.parse(l).eventId), ['E1', 'E1', 'E1', 'E1']);
+  assert.ok(!existsSync(`${path}.purge.tmp`));
+});
+
+// ---- 14. the --fresh opt-out is exact
+test('resume: --fresh is recognised only when it is actually asked for', () => {
+  assert.equal(wantsFresh(['--fresh'], {}), true);
+  assert.equal(wantsFresh([], { PILOT5_FRESH: '1' }), true);
+  assert.equal(wantsFresh([], {}), false);
+  // Consent to destroy ~1.2 days of work must be exact, never inferred.
+  assert.equal(wantsFresh(['--fres'], {}), false);
+  assert.equal(wantsFresh(['--fresh-start'], {}), false);
+  assert.equal(wantsFresh([], { PILOT5_FRESH: '0' }), false);
+  assert.equal(wantsFresh([], { PILOT5_FRESH: 'true' }), false);
+});
+
+// ==========================================================================
+// TWO SESSIONS IN ONE PROCESS
+//
+// The author will very likely run level 1 and level 2 side by side to halve
+// the ~1.7 days of wall clock, and the lock deliberately permits that:
+// different levels are different locks. Everything below is about what that
+// concurrency does to state the two sessions share.
+// ==========================================================================
+
+// ---- 15. FINDING A: one status log per session, not per process
+test('status: level 1 and level 2 side by side each keep their OWN status log', async () => {
+  const dir = scratchDir('statuslogs');
+  const evs = (lvl: number) => [1, 2, 3].map(i =>
+    ({ id: `E${i}_L${lvl}`, text: `FICTIONAL COMPANY ${i} reported revenue of $${i}B, up 10%.` }));
+  const at = (level: number) => run(['mock'], null, {
+    outDir: dir, level, mode: 'full', concurrency: 2, repeats: 1,
+    events: evs(level), models: [MOCK_MODEL], packs: [],
+    makeClient: () => mockLadderClient(outputPaths(dir, level, 'full').raw),
+  });
+
+  // Both sessions really are in flight together: run() takes its lock and (in
+  // the broken version) reassigned the shared status path synchronously, before
+  // its first await.
+  const [r1, r2] = await Promise.all([at(1), at(2)]);
+  assert.equal(r1.completed, 3);
+  assert.equal(r2.completed, 3);
+
+  // Before the fix, L1_run_status.txt held its 2 header lines and NOTHING else:
+  // no calibration line, no per-event progress, no "FULL done", no artefact
+  // lines. All 18 of them were in L2_run_status.txt. The run was fine; the
+  // record of it — the only diagnostic there is over 1.7 days — was gone.
+  for (const level of [1, 2]) {
+    const ls = lines(outputPaths(dir, level).status);
+    const has = (re: RegExp) => ls.some(l => re.test(l));
+    assert.ok(has(/=== FULL session/), `L${level}: no session header`);
+    assert.ok(has(/\[calib\] mock: template overhead/), `L${level}: the calibration line went to the other session`);
+    assert.equal(ls.filter(l => /^\[full\] \(\d\/3\)/.test(l)).length, 3, `L${level}: per-event progress is missing`);
+    assert.ok(has(/FULL done\. 3\/3/), `L${level}: no completion line`);
+    assert.equal(ls.filter(l => /^\[report\] wrote /.test(l)).length, 4, `L${level}: the artefact lines are missing`);
+    const other = level === 1 ? 2 : 1;
+    assert.ok(!ls.some(l => l.includes(`_L${other}`)), `L${level}'s log swallowed L${other}'s lines`);
+  }
+});
+
+// ---- 16. FINDING B: the shared calibration cache cannot be clobbered
+test('calibration: a model key survives the filename round trip, and the name is safe', () => {
+  for (const key of ['qwen3-32b@on', 'qwen3-32b@off', 'deepseek-chat-v3-0324',
+                     'meta-llama/llama-3.3-70b:free', 'weird key 50%?*', 'CamelCase', 'ünïcode']) {
+    const enc = encodeModelKey(key);
+    assert.equal(decodeModelKey(enc), key, `${key} did not survive the round trip`);
+    // Lower case only, and none of the characters Windows refuses: the key is
+    // the join back to the ledger, so it has to come out the way it went in.
+    assert.match(enc, /^[a-z0-9._%-]*$/, `${enc} is not a safe, case-collision-free filename`);
+  }
+  const d = tmpdir();
+  assert.notEqual(overheadPathFor(d, 'qwen3-32b@on'), overheadPathFor(d, 'qwen3-32b@off'));
+});
+
+test('calibration: a session cannot clobber a concurrent session\'s measurement', async () => {
+  const dir = scratchDir('calibrace');
+  const spec = (key: string): ModelSpec => ({ ...MOCK_MODEL, key, slug: `mock/${key}` });
+  const X = spec('qwen3-32b@on'), Y = spec('deepseek-chat-v3-0324'), Z = spec('llama-3.3-70b');
+
+  // The full session holds at its FIRST call — the calibration probe — until
+  // the probe session has measured and written Z. That is exactly the
+  // interleaving that lost Z: read the whole object once, rewrite it whole
+  // later. Deterministic, not a hoped-for timing coincidence.
+  let release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  const gated = (m: ModelSpec): LadderClient => {
+    const inner = mockLadderClient(outputPaths(dir, 1, 'full').raw, m.key);
+    let first = true;
+    return {
+      beginStructureRun: inner.beginStructureRun,
+      async generate(req: GenerateRequest) {
+        if (first) { first = false; await gate; }
+        return inner.generate(req);
+      },
+    };
+  };
+
+  const full = run([X.key, Y.key], null, {
+    outDir: dir, level: 1, mode: 'full', concurrency: 1, repeats: 1,
+    events: [EVENTS[0]], models: [X, Y], packs: [], makeClient: gated,
+  });
+  const probe = run([Z.key], 1, {
+    outDir: dir, level: 2, mode: 'probe', concurrency: 1, repeats: 1,
+    events: [EVENTS[0]], models: [Z], packs: [],
+    makeClient: (m: ModelSpec) => mockLadderClient(outputPaths(dir, 2, 'probe').raw, m.key),
+  });
+
+  await probe;
+  assert.equal(readOverhead(dir, Z.key), 7, 'the probe did not record its own measurement');
+  release();
+  await full;
+
+  // All three survive, each in its own file, each naming the model it belongs
+  // to. Before the fix the file held only X and Y; Z's paid call was lost, and
+  // would have been paid for again.
+  for (const m of [X, Y, Z]) {
+    const p = overheadPathFor(dir, m.key);
+    assert.ok(existsSync(p), `${m.key} has no calibration file: its measurement was clobbered`);
+    const o = JSON.parse(readFileSync(p, 'utf-8'));
+    assert.equal(o.modelKey, m.key, `${p} holds ${o.modelKey}'s measurement, not ${m.key}'s`);
+    assert.equal(o.overhead, 7);
+  }
+});
+
+test('calibration: an existing template_overhead.json is migrated, not orphaned', async () => {
+  const dir = scratchDir('calibmigrate');
+  const legacy = outputPaths(dir, 1).overheadLegacy;
+  // Two REAL measurements, in the pre-per-model format. 11 and 13 are not what
+  // the mock would measure (7), so re-measurement is distinguishable from reuse.
+  const before = JSON.stringify({ 'qwen3-32b@on': 11, 'deepseek-chat-v3-0324': 13 }, null, 2);
+  writeFileSync(legacy, before);
+
+  const M: ModelSpec = { ...MOCK_MODEL, key: 'qwen3-32b@on' };
+  const go = () => run([M.key], null, {
+    outDir: dir, level: 1, mode: 'full', concurrency: 1, repeats: 1,
+    events: [EVENTS[0]], models: [M], packs: [],
+    makeClient: () => mockLadderClient(outputPaths(dir, 1, 'full').raw, M.key),
+  });
+  assert.equal((await go()).completed, 1);
+
+  assert.equal(readOverhead(dir, 'qwen3-32b@on'), 11,
+    'the migrated measurement was thrown away and the model re-measured');
+  assert.equal(readOverhead(dir, 'deepseek-chat-v3-0324'), 13,
+    'a model that did not run in this session lost its measurement');
+  // A migrated value was not measured now, and the file may not claim it was.
+  const migrated = JSON.parse(readFileSync(overheadPathFor(dir, 'qwen3-32b@on'), 'utf-8'));
+  assert.match(migrated.measuredAt, /migrated from template_overhead\.json/);
+  // The original is kept, byte for byte: it holds real measurements, so if the
+  // split ever turns out wrong the evidence is still on disk.
+  assert.ok(!existsSync(legacy), 'the legacy file would be re-read on every start');
+  assert.equal(readFileSync(`${legacy}.migrated`, 'utf-8'), before);
+  assert.ok(lines(outputPaths(dir, 1).status).some(l => /migrated 2 measurement/.test(l)),
+    'moving another run\'s calibration data may not be silent');
+
+  // Idempotent: the next session finds nothing to migrate and changes nothing.
+  await go();
+  assert.equal(readOverhead(dir, 'qwen3-32b@on'), 11);
+  assert.equal(readFileSync(`${legacy}.migrated`, 'utf-8'), before);
+});
+
+// ---- 17. FINDING C: the lock must ALLOW what it is meant to allow
+test('lock: two different levels, and a probe beside a full run, all proceed', async () => {
+  // Every other lock test here checks that it REFUSES. A defect that made
+  // acquireLock scan sibling *_run.lock files and treat ANY of them as held —
+  // a level-blind lock that blocks exactly the work this design permits —
+  // passed all 51 of them. This is the other half.
+  const dir = scratchDir('locklevels');
+  const at = (level: number, mode = 'full') => run(['mock'], null, {
+    outDir: dir, level, mode, concurrency: 2, repeats: 1,
+    events: EVENTS.map(e => ({ ...e, id: e.id.replace('_L1', `_L${level}`) })),
+    models: [MOCK_MODEL], packs: [],
+    makeClient: () => mockLadderClient(outputPaths(dir, level, mode).raw),
+  });
+  const [a, b] = await Promise.all([at(1), at(2)]);
+  assert.equal(a.completed, 2, 'the level-1 session was blocked by the level-2 lock');
+  assert.equal(b.completed, 2, 'the level-2 session was blocked by the level-1 lock');
+  assert.ok(!existsSync(outputPaths(dir, 1).lock) && !existsSync(outputPaths(dir, 2).lock),
+    'a lock outlived the session that held it');
+
+  // Same level, different mode: a probe has its own prefix, its own files and
+  // its own lock, so it must be able to run beside the full session it is
+  // smoke-testing for.
+  const dir2 = scratchDir('lockprobe');
+  const at2 = (mode: string) => run(['mock'], null, {
+    outDir: dir2, level: 1, mode, concurrency: 2, repeats: 1,
+    events: EVENTS, models: [MOCK_MODEL], packs: [],
+    makeClient: () => mockLadderClient(outputPaths(dir2, 1, mode).raw),
+  });
+  const [f, p] = await Promise.all([at2('full'), at2('probe')]);
+  assert.equal(f.completed, 2, 'a probe blocked the full run on the same level');
+  assert.equal(p.completed, 2, 'the full run blocked the probe on the same level');
+});
+
+// ---- 18. FINDING D: the claim itself is exclusive
+test('lock: two simultaneous claims — exactly one wins, and the loser is told who holds it', () => {
+  const dir = scratchDir('lockrace');
+  const P = outputPaths(dir, 1);
+  const said: string[] = [];
+  const info = (pid: number) => ({
+    pid, host: hostname(), started: `2026-09-01T00:00:0${pid}.000Z`, mode: 'full', level: 1,
+  });
+
+  // Both attempts must OBSERVE "no lock present" and only then write — the
+  // check and the write are two syscalls, and `flag: 'wx'` is what closes that
+  // window. acquireLock is synchronous, so the window is opened DELIBERATELY
+  // rather than hoped for: B's complete claim is slid into A's, after A has
+  // looked and before A writes. Removing the flag and changing nothing else
+  // passed all 51 subtests; nothing mentioned EEXIST or wx.
+  let releaseB: (() => void) | null = null;
+  let bFailed: unknown = null;
+  let aFailed: any = null;
+  let aRelease: (() => void) | null = null;
+  try {
+    aRelease = acquireLock(P.lock, info(1), l => said.push(l), {
+      beforeClaim: () => {
+        if (releaseB) return;                       // A's claim, once
+        try { releaseB = acquireLock(P.lock, info(2), l => said.push(l)); }
+        catch (e) { bFailed = e; }
+      },
+    });
+  } catch (e) { aFailed = e; }
+
+  assert.equal(bFailed, null, 'the session that got there first must not be refused');
+  assert.ok(releaseB, 'nobody took the lock at all');
+  assert.ok(aFailed, 'BOTH claims succeeded: two sessions would run one level and bill every event twice');
+  assert.equal(aRelease, null);
+  assert.match(aFailed.message, /at the same instant/);
+  // Refusing without saying who won leaves the operator with nothing to act on.
+  assert.match(aFailed.message, /pid 2/);
+
+  // The file holds the WINNER, untouched by the loser.
+  const holder = readLockInfo(readFileSync(P.lock, 'utf-8'))!;
+  assert.equal(holder.pid, 2, 'the loser overwrote the winner\'s lock file');
+  assert.equal(holder.started, info(2).started);
+  const lost = said.find(l => l.includes('LOST THE RACE'));
+  assert.ok(lost, 'losing the race was silent');
+  assert.match(lost!, /pid 2/);
+
+  releaseB!();
+  assert.ok(!existsSync(P.lock), 'the winner could not release the lock it holds');
 });

@@ -167,9 +167,35 @@ export function structureRecords(all: CallLedgerRecord[], s: StructureName): Cal
 }
 
 /**
- * Run all three rungs for one event on one model. Malformed calls (after the
- * single retry) drop the affected structure(s); a malformed WORKER drops all
- * three, since all three depend on the worker set.
+ * Run all three rungs for one event on one model.
+ *
+ * TWO kinds of failure, and the distinction is the whole difference between a
+ * result and an outage (2026-09-01):
+ *
+ *  - MalformedCallError — the model did not produce a parseable answer after
+ *    its pre-registered retries (D16). That IS a measurement: the affected
+ *    structure is dropped, the drop is recorded, and it belongs in the D16
+ *    failure taxonomy. A malformed WORKER drops all three rungs, since all
+ *    three are built on the worker set.
+ *
+ *  - anything else — a CostCapError, or a plain Error the client raises once
+ *    ITS own retry budget for 5xx / timeout / connection reset is spent. That
+ *    is NOT a measurement, so it PROPAGATES out of this function: run-pilot5
+ *    then writes no outcomes line, and the event is retried on the next
+ *    resume. This is not a nicety. Swallowing it recorded `dropped=true` for a
+ *    provider outage, and because the outcomes line IS the resume marker, the
+ *    event counted as done and was never retried — a five-minute outage
+ *    permanently converted every event in flight into a fake failure. Measured
+ *    on the reproduction before this fix: one injected ECONNRESET on
+ *    `worker_2` left the event on disk with 2 ledger records, all three rungs
+ *    `dropped=true`, and the resume reporting `completed=0 skipped=2`. It also
+ *    contradicted the caption the thesis quotes (make-report5.ts D16:
+ *    "Infrastructure errors ... never appear here; the client retries them
+ *    itself").
+ *
+ * The half-finished ledger of a propagating run is deliberately discarded with
+ * it: nothing is appended to L*_ledger5.jsonl, and the raw client log's
+ * records for that event are orphans, which the resume purge removes.
  */
 export async function runLadder(
   llm: LLMClient,
@@ -193,7 +219,7 @@ export async function runLadder(
       }),
     ),
   );
-  const workerFail = firstFailure(workerSettled, 'worker');
+  const workerFail = firstMalformed(workerSettled);
   if (workerFail) {
     for (const s of STRUCTURES) outcomes[s] = drop(workerFail);
     return { eventId: ev.id, modelKey, outcomes, ledger, roundProbabilities, matched: [], repetitionRuns: [], aggregatorNumberLeaks };
@@ -218,7 +244,11 @@ export async function runLadder(
       });
       outcomes.aggregator = { probability: r.parsed.probability, dropped: false };
     } catch (e) {
-      outcomes.aggregator = drop(e instanceof MalformedCallError ? e.message : `aggregator error: ${(e as Error).message}`);
+      // Only a format failure is the aggregator's own result. An outage (or the
+      // cost cap) is rethrown, so this event produces no outcomes line at all
+      // and is retried whole — see the two-kinds-of-failure note on runLadder.
+      if (!(e instanceof MalformedCallError)) throw e;
+      outcomes.aggregator = drop(e.message);
     }
   }
 
@@ -239,7 +269,7 @@ export async function runLadder(
             .then(r => ({ agentId: own.agentId, fullText: r.fullVisible, probability: r.parsed.probability }));
         }),
       );
-      failed = firstFailure(settled, 'debate');
+      failed = firstMalformed(settled);   // an outage in round r throws out of the loop and out of runLadder
       if (!failed) {
         states = settled.map(r => (r as PromiseFulfilledResult<typeof states[number]>).value);
         roundProbabilities.push(states.map(s => s.probability));
@@ -338,6 +368,16 @@ export async function runLadder(
           const billed = billedFor('repetition', `rep_${startIdx + k + 1}`);
           const r = settled[k];
           if (r.status !== 'fulfilled') {
+            // Same rule as the three rungs: only a malformed draw is a result.
+            // An outage here does not drop anything — it silently SHORTENS the
+            // communication-free baseline, which is the one confound this
+            // matching exists to rule out. Measured on the reproduction: with
+            // the extra draws failing, debate was compared against a 3-run
+            // baseline (945 of 3,948 tokens, residual 3,003) instead of the
+            // 12-run one it should have had (3,765/3,948, residual 183) — a
+            // 4x understated null hypothesis, written to disk with no drop
+            // flag and no way to tell afterwards.
+            if (!(r.reason instanceof MalformedCallError)) throw r.reason;
             // An extra run that produced nothing usable still cost money. Not
             // charging for it let the baseline keep drawing on a budget it had
             // already spent, which is the same bug as above with the sign
@@ -385,14 +425,28 @@ const MAX_EXTRA_RUNS = 200;
  */
 const MAX_BATCH = 8;
 
-function firstFailure(settled: PromiseSettledResult<unknown>[], what: string): string | null {
+/**
+ * Triage a batch of settled sibling calls: return the first MalformedCallError's
+ * message (a result the caller records as a drop) and RETHROW anything else (an
+ * outage the caller must not record at all).
+ *
+ * The whole batch is scanned before returning, so an infrastructure error wins
+ * over a malformed sibling no matter which order they settled in: "the provider
+ * fell over" is not made less true by one agent also having produced garbage,
+ * and the two orders must not give different data.
+ *
+ * The original error object is rethrown, never a wrapped copy — run-pilot5
+ * distinguishes the cost cap from everything else with `instanceof
+ * CostCapError`, which a re-wrapped message would defeat.
+ */
+function firstMalformed(settled: PromiseSettledResult<unknown>[]): string | null {
+  let malformed: string | null = null;
   for (const r of settled) {
-    if (r.status === 'rejected') {
-      const e = r.reason;
-      return e instanceof MalformedCallError ? e.message : `${what} error: ${(e as Error)?.message ?? String(e)}`;
-    }
+    if (r.status !== 'rejected') continue;
+    if (r.reason instanceof MalformedCallError) malformed ??= r.reason.message;
+    else throw r.reason;
   }
-  return null;
+  return malformed;
 }
 
 /** A view on the same ledger that stamps a different structure name on new records. */

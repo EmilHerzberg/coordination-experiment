@@ -1,5 +1,12 @@
-// Builds pilot5/ledger_report_v2.md from pilot5/ledger5.jsonl + outcomes.jsonl.
-//   node --experimental-transform-types --import ./register.mjs make-report5.ts
+// Builds pilot5/L{level}_report.md from L{level}_ledger5.jsonl + L{level}_outcomes.jsonl.
+//   node --experimental-transform-types --import ./register.mjs make-report5.ts \
+//        [--ledger <path>] [--outcomes <path>] [--out <path>]
+//
+// `run-pilot5.ts` imports `buildReport` and writes the report at the end of
+// every full run, so this entrypoint is now only for re-rendering an archived
+// ledger. The defaults carry the level prefix: the old unprefixed
+// `ledger_report_v2.md` is exactly how a level-1 report ended up sitting next
+// to a level-2 `ledger5.jsonl` describing a different run.
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,10 +14,11 @@ import { summarize, localTokens, type CallLedgerRecord, type StructureTotals } f
 import { structureRecords, STRUCTURES, COMBINER_ROLES, spread, sd, type StructureName } from './structures5.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const OUTDIR = resolve(HERE, '..', '..', 'pilot5');
-const LEDGER_PATH = resolve(OUTDIR, 'ledger5.jsonl');
-const OUTCOMES_PATH = resolve(OUTDIR, 'outcomes.jsonl');
-const REPORT_PATH = resolve(OUTDIR, 'ledger_report_v2.md');
+const OUTDIR = process.env.PILOT5_OUTDIR ? resolve(process.env.PILOT5_OUTDIR) : resolve(HERE, '..', '..', 'pilot5');
+const LEVEL = (process.env.PILOT5_LEVEL ?? '1') === '2' ? 2 : 1;
+const LEDGER_PATH = resolve(OUTDIR, `L${LEVEL}_ledger5.jsonl`);
+const OUTCOMES_PATH = resolve(OUTDIR, `L${LEVEL}_outcomes.jsonl`);
+const REPORT_PATH = resolve(OUTDIR, `L${LEVEL}_report.md`);
 
 function readJsonl<T>(p: string): T[] {
   if (!existsSync(p)) return [];
@@ -200,7 +208,7 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
   L.push('');
   L.push('## Malformed attempts');
   L.push('');
-  L.push("_Split by cause (D16). `truncated` means the answer hit our per-call token cap so no closing tag was written — that is the cap being too low, not the model failing to comply, and the remedy is raising the cap rather than dropping the event. `format` is the only genuine model failure. Infrastructure errors (5xx, timeouts, rate limits) never appear here; the client retries them itself._");
+  L.push("_Split by cause (D16). `truncated` means the answer hit our per-call token cap so no closing tag was written — that is the cap being too low, not the model failing to comply, and the remedy is raising the cap rather than dropping the event. `format` is the only genuine model failure. Infrastructure errors (5xx, timeouts, rate limits) never appear here; the client retries them itself, and an event whose calls fail anyway is left WITHOUT an outcomes line and re-run on the next resume rather than booked as a drop (see the two-kinds-of-failure note on runLadder)._");
   L.push('');
   const bad = records.filter(r => r.malformed);
   const okRecords = records.filter(r => r.ok);
@@ -219,9 +227,23 @@ export function buildReport(records: CallLedgerRecord[], outcomes: OutcomeLine[]
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const records = readJsonl<CallLedgerRecord>(LEDGER_PATH);
-  const outcomes = readJsonl<OutcomeLine>(OUTCOMES_PATH);
-  if (!records.length) { console.error(`no records in ${LEDGER_PATH}`); process.exit(1); }
-  writeFileSync(REPORT_PATH, buildReport(records, outcomes));
-  console.log(`wrote ${REPORT_PATH}`);
+  const argv = process.argv.slice(2);
+  const arg = (flag: string) => {
+    const i = argv.indexOf(flag);
+    if (i < 0) return undefined;
+    const v = argv[i + 1];
+    // A flag with nothing after it must not fall through to the default path
+    // and silently overwrite the wrong file.
+    if (v === undefined || v.startsWith('--')) { console.error(`${flag} needs a path`); process.exit(1); }
+    return v;
+  };
+  const ledgerPath = resolve(arg('--ledger') ?? LEDGER_PATH);
+  const outcomesPath = resolve(arg('--outcomes') ?? OUTCOMES_PATH);
+  const reportPath = resolve(arg('--out') ?? REPORT_PATH);
+
+  const records = readJsonl<CallLedgerRecord>(ledgerPath);
+  const outcomes = readJsonl<OutcomeLine>(outcomesPath);
+  if (!records.length) { console.error(`no records in ${ledgerPath}`); process.exit(1); }
+  writeFileSync(reportPath, buildReport(records, outcomes));
+  console.log(`wrote ${reportPath}`);
 }

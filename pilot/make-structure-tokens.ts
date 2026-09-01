@@ -21,9 +21,12 @@ import { summarize, type CallLedgerRecord } from './ledger5.js';
 import { structureRecords, STRUCTURES, COMBINER_ROLES, type StructureName } from './structures5.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const OUTDIR = resolve(HERE, '..', '..', 'pilot5');
-const LEDGER_PATH = resolve(OUTDIR, 'ledger5.jsonl');
-const TOKENS_PATH = resolve(OUTDIR, 'structure_tokens.jsonl');
+const OUTDIR = process.env.PILOT5_OUTDIR ? resolve(process.env.PILOT5_OUTDIR) : resolve(HERE, '..', '..', 'pilot5');
+// Level-prefixed, matching what `run-pilot5.ts` writes. See buildMeta below for
+// why an unprefixed default was actively dangerous here.
+const LEVEL = (process.env.PILOT5_LEVEL ?? '1') === '2' ? 2 : 1;
+const LEDGER_PATH = resolve(OUTDIR, `L${LEVEL}_ledger5.jsonl`);
+const TOKENS_PATH = resolve(OUTDIR, `L${LEVEL}_structure_tokens.jsonl`);
 
 function readJsonl<T>(p: string): T[] {
   if (!existsSync(p)) return [];
@@ -115,11 +118,14 @@ export function buildStructureTokens(records: CallLedgerRecord[]): StructureToke
  * The provenance header.
  *
  * It exists so the Python side can refuse a summary belonging to a different
- * ledger. The harness always writes fixed filenames (`ledger5.jsonl`) and the
- * runs are archived afterwards as `L1_ledger5.jsonl` / `L2_ledger5.jsonl`, so
- * a stale `structure_tokens.jsonl` sitting next to a freshly re-run ledger
- * looks exactly like a current one. The hash is the only thing that tells them
- * apart.
+ * ledger. Until 2026-09-01 the harness wrote fixed filenames (`ledger5.jsonl`)
+ * and the runs were archived afterwards, BY HAND, as `L1_ledger5.jsonl` /
+ * `L2_ledger5.jsonl` — so a stale `structure_tokens.jsonl` sitting next to a
+ * freshly re-run ledger looked exactly like a current one, and the hash was the
+ * only thing that told them apart. The runner now writes the level prefix from
+ * the start and regenerates this file itself at the end of every run, which
+ * removes the way that mismatch was created; the hash stays, because it is the
+ * only check that survives a file being copied or re-run out of band.
  */
 export function buildMeta(ledgerPath: string, records: CallLedgerRecord[]): StructureTokenMeta {
   // Hash the raw BYTES, not the parsed text. These files are CRLF, and reading
