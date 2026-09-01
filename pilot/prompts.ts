@@ -213,19 +213,42 @@ export function debateRevisePrompt(
  *
  * Known limits, stated because this figure is reported: a reason that says
  * "roughly even odds" without a numeral is not caught, and a cited figure that
- * happens to coincide with the forecast (a stock down 45% in an answer of 0.45)
- * is a false positive. It is a floor on the leak rate, not an exact count.
+ * genuinely coincides with the forecast - a stock down 45% in an answer of 0.45
+ * - is still a false positive, because no amount of pattern matching can tell
+ * those apart. It is a floor on the leak rate, not an exact count.
+ *
+ * What it is NOT any more is a substring artefact: see the boundaries below.
  */
 export function reasonStatesOwnNumber(reason: string, probability: number): boolean {
-  const pct = Math.round(probability * 100);
-  const forms = [
-    probability.toFixed(2),                       // 0.45
-    String(probability),                          // 0.45
-    '.' + String(pct).padStart(2, '0'),           // .45
-    pct + '%',
-    pct + ' %',
-    pct + ' percent',
-  ];
   const hay = reason.toLowerCase();
-  return forms.some(f => hay.includes(f.toLowerCase()));
+  const pct = Math.round(probability * 100);
+  const patterns: RegExp[] = [];
+
+  // The boundaries are the whole point, and the first version did not have them.
+  // It tested `hay.includes('.65')`, which is true of "the S&P has lagged 9.65%"
+  // - an unrelated market figure - so an answer of 0.65 was flagged as leaking
+  // its own number when it had done nothing of the sort. Measured on the pilot
+  // logs the loose version flagged 4 of 12 worker answers where 3 are genuine.
+  // Financial reasoning is made of percentages, so this fires often, and the
+  // leak rate is a number the thesis reports (D27).
+  //
+  // `(?<![DIGIT.])` refuses a match preceded by a digit or a decimal point, so
+  // "9.65" and "10.35" cannot supply the fraction, and "165%" cannot supply the
+  // percentage.
+  const left = '(?<![0-9\\.])';
+
+  // "65 %", "65%", "65 percent"
+  patterns.push(new RegExp(left + pct + '\\s*(?:%|percent)'));
+
+  // "0.65" and ".65", and the two-decimal spelling "0.50" of 0.5. A trailing
+  // digit is refused too, so 0.65 is not found inside "0.653".
+  const spellings = new Set([String(probability), probability.toFixed(2)]);
+  for (const dec of spellings) {
+    const dot = dec.indexOf('.');
+    if (dot < 0) continue;   // 0 and 1 have no fraction; a bare "1" would match everywhere
+    const frac = '\\.' + dec.slice(dot + 1);
+    patterns.push(new RegExp(left + '0?' + frac + '(?![0-9])'));
+  }
+
+  return patterns.some(re => re.test(hay));
 }

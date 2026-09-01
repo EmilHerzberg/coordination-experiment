@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import type { GenerateRequest, GenerateResponse, LLMClient } from '../src/types.js';
 import { parseTagged, stripThink, TaggedParseError } from './tagged.js';
 import { Ledger5, localTokens, summarize, splitTokens, MalformedCallError, type ProviderExtras } from './ledger5.js';
-import { workerPrompt, aggregatorPrompt, debateRevisePrompt } from './prompts.js';
+import { workerPrompt, aggregatorPrompt, debateRevisePrompt, reasonStatesOwnNumber } from './prompts.js';
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 import { buildStructureTokens } from './make-structure-tokens.js';
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -1493,4 +1493,47 @@ test('lock: two simultaneous claims — exactly one wins, and the loser is told 
 
   releaseB!();
   assert.ok(!existsSync(P.lock), 'the winner could not release the lock it holds');
+});
+
+// ---- D27 leak detector: boundaries, not substrings
+test('audit: reasonStatesOwnNumber matches whole numbers, not substrings of other figures', () => {
+  // The first version tested `hay.includes('.65')`. Financial reasoning is made
+  // of percentages, so "the S&P has lagged 9.65%" flagged an answer of 0.65 as
+  // having leaked its own probability when it had done nothing of the sort.
+  // Measured on the pilot logs, the loose version reported 4 of 12 worker
+  // answers where 3 are genuine - and that rate is a number the thesis reports.
+  const notALeak: [string, number][] = [
+    ['the S&P 500 has lagged (1.70% and 9.65% over the same periods)', 0.65],
+    ['revenue rose 10.35% year on year', 0.35],
+    ['a 165% move is impossible', 0.65],
+    ['my estimate is 0.653', 0.65],
+    ['exactly 0.6500 here', 0.65],
+    ['roughly even odds', 0.5],          // verbal, not caught by design
+  ];
+  for (const [text, p] of notALeak) {
+    assert.equal(reasonStatesOwnNumber(text, p), false, `must NOT flag: ${text}`);
+  }
+
+  // What it must still catch, including the two spellings of one probability.
+  const isALeak: [string, number][] = [
+    ['A 55% probability balances the likelihood of a reversal', 0.55],
+    ['implies a 45% chance of positive abnormal returns', 0.45],
+    ['I put this at .65', 0.65],
+    ['probability 0.50 seems fair', 0.5],
+    ['about 50 percent', 0.5],
+    ['I would say 50 % here', 0.5],
+  ];
+  for (const [text, p] of isALeak) {
+    assert.equal(reasonStatesOwnNumber(text, p), true, `must flag: ${text}`);
+  }
+
+  // The property the boundaries exist for, stated once more as an invariant:
+  // embedding the answer's own digits inside a LARGER number is never a leak.
+  for (const p of [0.35, 0.45, 0.55, 0.65]) {
+    const pct = Math.round(p * 100);
+    assert.equal(reasonStatesOwnNumber(`the index moved 1.${pct}% last week`, p), false,
+      `1.${pct}% must not flag ${p}`);
+    assert.equal(reasonStatesOwnNumber(`a ${pct}% chance`, p), true,
+      `a bare ${pct}% must flag ${p}`);
+  }
 });
