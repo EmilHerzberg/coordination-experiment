@@ -80,7 +80,12 @@ export interface ModelSpec {
 //
 // Prices here are for the offline estimate only; real cost comes from usage.cost.
 export const MODELS: ModelSpec[] = [
-  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 300 },
+  // minIntervalMs raised 300 -> 3000 on 2026-09-04: the end-to-end test run
+  // showed qwen at 0.3s spacing failing 32%% of calls on DeepInfra (429), against
+  // 0%% for deepseek at 3s. One failed call drops a whole ~18-call event, so every
+  // event was lost. The throttle is per-model per-PROCESS, so two concurrent
+  // levels halve the effective spacing again. Match deepseek. See testrun10.
+  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 3000 },
   // RE-PINNED 2026-08-28 (D24) from DeepInfra fp4 to SiliconFlow fp8.
   //
   // DeepInfra returned BYTE-IDENTICAL text for concurrent identical prompts —
