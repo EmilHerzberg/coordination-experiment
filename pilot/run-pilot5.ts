@@ -418,6 +418,28 @@ export function completedKeys(outcomeLines: readonly string[]): Set<string> {
  * and `buildStructureTokens` both read the ledger in generation order, so a
  * resumed run must EXTEND that order rather than reshuffle it.
  */
+/**
+ * Deterministic in-place Fisher-Yates shuffle (mulberry32 PRNG). Seeded so the
+ * order is reproducible across resumes and machines; Math.random would make
+ * every resume see a different order, which is exactly what determinism rules
+ * out. Exported for the tests.
+ */
+export function shuffleInPlace<T>(arr: T[], seed: number): T[] {
+  let s = seed >>> 0;
+  const rand = () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 export function planWork<T extends { m: { key: string }; ev: { id: string } }>(
   tasks: readonly T[],
   doneKeys: ReadonlySet<string>,
@@ -888,8 +910,21 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
       ).flat(),
     );
     const { todo: tasks, skipped } = planWork(allTasks, doneKeys);
+    // D31/II-8 (2026-09-05): the work list is SHUFFLED with a fixed seed, so an
+    // early close (cost cap, kill) leaves an ~random subset of events instead
+    // of an alphabetical prefix "A to somewhere" — and, as a bonus, the models
+    // are interleaved, which removes the starvation the 2026-09-04 test run
+    // documented (all of one model's events queued before the other's).
+    //
+    // NOT to be confused with the sample draw: WHICH events run is decided
+    // solely by the pinned event_sample.txt (its own seed, 20260903). This
+    // shuffle only changes the ORDER they are worked through. It is seeded and
+    // deterministic, so resumes see the same order; and it does not touch the
+    // within-event generation order of the repetition pool, which is what
+    // compute matching consumes.
+    shuffleInPlace(tasks, 20260905);
     if (skipped.length) status(`resuming: ${skipped.length} of ${allTasks.length} done, ${tasks.length} to go`);
-    status(`${tasks.length} ladder runs over ${roster.length} models, concurrency ${concurrency}`);
+    status(`${tasks.length} ladder runs over ${roster.length} models, concurrency ${concurrency}, order seed-shuffled (D31)`);
 
     // ---- calibration first, sequentially: one cheap probe per model (D18).
     const paramsByModel = new Map<string, LadderParams>();
