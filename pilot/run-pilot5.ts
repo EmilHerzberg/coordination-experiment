@@ -120,6 +120,57 @@ export const RESERVE_MODELS: ModelSpec[] = [
   { key: 'qwen3-32b@off',  slug: 'qwen/qwen3-32b',                    provider: 'SiliconFlow', mode: 'reason_off', arm: 'non-reasoning', evidence: 'first', priceIn: 0.14, priceOut: 0.57 },
 ];
 
+// D29 (2026-09-05): qwen3-32b@on is LOAD-SPLIT across two fp8 endpoints. During
+// the end-to-end test run DeepInfra throttled qwen on a sustained quota (a single
+// event booked in ~50 min at minIntervalMs=3000). SiliconFlow serves the same
+// model at the same fp8 precision, so the two are ONE arm, not two.
+//
+// probe-qwen-providers.ts, 2026-09-05, 8 concurrent identical calls per provider,
+// interleaved, real worker prompt, temp 0.7:
+//   - DISTINCT content 8/8 AND distinct gen_id 8/8 on BOTH -> no concurrent
+//     collapse either side (this is the D24 failure that re-pinned deepseek;
+//     qwen is clean on both). RQ1's independent-sampling assumption holds.
+//   - reasoning fires 8/8 on both (the @on toggle works on SiliconFlow too).
+//   - prompt_tokens 629 (DeepInfra) vs 628 (SiliconFlow): a 1-token chat-template
+//     offset, NOT a content-tokenization difference. The ledger treats the
+//     provider's prompt_tokens as authoritative and rescales the D/A/B/B_SELF
+//     buckets to it (ledger5.ts:12-13, 307-311), so D+A+B+B_SELF=prompt_tokens
+//     holds for 628 or 629 alike; no identity breaks. The offset lands only on
+//     the shared D baseline (content-identical across conditions), 0.16%.
+//
+// Events are pinned to a provider by a hash of their BASE id (level- and
+// repeat-independent), so (a) every call in one ladder run shares one token
+// basis and (b) L1 and L2 of an event use the same provider. The offset is then
+// constant within every event and CANCELS in the within-event comparisons that
+// RQ1-paired / RQ2 / RQ3 make. modelKey stays 'qwen3-32b@on' (one arm); the
+// provider actually used is recorded per call as provider_pinned/returned.
+const PROVIDER_SPLIT: Record<string, string[]> = {
+  'qwen3-32b@on': ['DeepInfra', 'SiliconFlow'],
+};
+
+/** Strip the "#rN" repeat suffix so all repeats of an event share its provider. */
+export function baseEventId(id: string): string {
+  return id.replace(/#r\d+$/, '');
+}
+
+/** djb2, stable across processes/runs (no Math.random, no Date). */
+function hash32(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h >>> 0;
+}
+
+/**
+ * Deterministic event->provider assignment for split models; identity for the
+ * rest. Same base id -> same provider on every run and at both levels, so the
+ * split is fully reproducible and never mixes two providers inside one ladder.
+ */
+export function providerForEvent(m: ModelSpec, evId: string): string {
+  const split = PROVIDER_SPLIT[m.key];
+  if (!split || split.length < 2) return m.provider;
+  return split[hash32(baseEventId(evId)) % split.length];
+}
+
 export const PARAMS: LadderParams = {
   agentCount: 3,
   debateRounds: 2,        // round 0 (= workers) + 2 revisions
@@ -759,18 +810,28 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
     // anything reads it, so no measurement that was paid for is orphaned.
     migrateOverheadCache(outDir, P.overheadLegacy, status);
 
-    // ---- one shared throttle per MODEL. Concurrent events each get their own
-    // client (so per-event logging stays correct) but must share the rate limit,
-    // or six parallel events would each get their own budget and burst again.
-    const throttles = new Map<string, Throttle>(
-      roster.map(m => [m.key, new Throttle(m.minIntervalMs ?? 0)]),
-    );
+    // ---- one shared throttle per MODEL×PROVIDER. Concurrent events each get
+    // their own client (so per-event logging stays correct) but must share the
+    // rate limit, or six parallel events would each get their own budget and
+    // burst again. For a split model (qwen@on, D29) each provider gets its own
+    // throttle, so the two fp8 endpoints are rate-limited independently and the
+    // aggregate qwen rate is ~2x that of a single endpoint.
+    const throttleKey = (mkey: string, provider: string) => `${mkey} ${provider}`;
+    const throttles = new Map<string, Throttle>();
+    for (const m of roster) {
+      for (const provider of PROVIDER_SPLIT[m.key] ?? [m.provider]) {
+        throttles.set(throttleKey(m.key, provider), new Throttle(m.minIntervalMs ?? 0));
+      }
+    }
 
     const apiKey = opts.makeClient ? '' : getKey();
-    const mkClient: (m: ModelSpec) => LadderClient = opts.makeClient ?? (m => new OpenRouterClient({
-      modelKey: m.key, modelSlug: m.slug, provider: m.provider, mode: m.mode,
-      apiKey, logPath: P.raw, cost, throttle: throttles.get(m.key),
-    }) as unknown as LadderClient);
+    // provider is resolved per event (D29 split); the test hook ignores it.
+    const mkClient: (m: ModelSpec, provider: string) => LadderClient = opts.makeClient
+      ? (m, _provider) => opts.makeClient!(m)
+      : (m, provider) => new OpenRouterClient({
+          modelKey: m.key, modelSlug: m.slug, provider, mode: m.mode,
+          apiKey, logPath: P.raw, cost, throttle: throttles.get(throttleKey(m.key, provider)),
+        }) as unknown as LadderClient;
 
     // ---- resume or restart. Never both, and never silently.
     let doneKeys = new Set<string>();
@@ -825,7 +886,10 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
       let overhead = readOverhead(outDir, m.key, status);
       if (overhead === undefined) {
         try {
-          const probe = await measureTemplateOverhead(mkClient(m));
+          // Template overhead is a model-level constant; the 1-token cross-provider
+          // offset (D29) is far below the proportional-residual noise the ledger
+          // already spreads, so one calibration on the default provider suffices.
+          const probe = await measureTemplateOverhead(mkClient(m, m.provider));
           overhead = probe.overhead;
           writeOverhead(outDir, m.key, overhead);
           status(`[calib] ${m.key}: template overhead ${overhead} tok/call (provider ${probe.providerPrompt} vs local ${probe.localCount})`);
@@ -846,7 +910,10 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
       }
       // Fresh client per task: beginStructureRun sets per-run logging state, which
       // concurrent tasks would otherwise clobber. The throttle is still shared.
-      const client = mkClient(m);
+      // provider is resolved per event so a split model's ladder runs entirely on
+      // one endpoint (D29); non-split models get their fixed provider.
+      const provider = providerForEvent(m, ev.id);
+      const client = mkClient(m, provider);
       client.beginStructureRun('ladder', ev.id);
       const t0 = Date.now();
       try {
