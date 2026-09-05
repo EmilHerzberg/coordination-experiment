@@ -61,6 +61,16 @@ export function buildTranscript(
   outcomes: OutcomeLine[],
   packs: any[],
   withReasoning: boolean,
+  /**
+   * Ground truth is OFF by default since 2026-09-05. The runner regenerates
+   * the transcripts at the end of every full session — resumes included — so
+   * with the label block unconditional, an open run's directory contained a
+   * file joining every booked forecast to its outcome, which contradicted the
+   * analysis plan's blinding rule (REVIEW_ANALYSIS_PLAN_2026-09-05.md, L2-01).
+   * The truth-bearing rendering still exists, but only via the explicit
+   * `--reveal-truth` CLI flag, to be used after the run is closed and scored.
+   */
+  revealTruth = false,
 ): string {
   const L: string[] = [];
 
@@ -86,8 +96,10 @@ export function buildTranscript(
     if (pack) {
       L.push(`**${pack.symbol}**, results released ${pack.reportDate}; prediction made after the close of ${pack.t0}.`);
       L.push('');
-      L.push(`> **Ground truth (never shown to any agent):** the five-day abnormal return was **${(pack.abnormalReturn * 100).toFixed(2)}%**, so the correct answer is **${pack.label === 1 ? 'POSITIVE (label 1)' : 'NEGATIVE (label 0)'}**. A good forecast puts its probability ${pack.label === 1 ? 'above' : 'below'} 0.5.`);
-      L.push('');
+      if (revealTruth) {
+        L.push(`> **Ground truth (never shown to any agent):** the five-day abnormal return was **${(pack.abnormalReturn * 100).toFixed(2)}%**, so the correct answer is **${pack.label === 1 ? 'POSITIVE (label 1)' : 'NEGATIVE (label 0)'}**. A good forecast puts its probability ${pack.label === 1 ? 'above' : 'below'} 0.5.`);
+        L.push('');
+      }
     }
 
     // ---------- round 0: the shared workers
@@ -208,13 +220,17 @@ if (isMain) {
   const packsPath = resolve(arg('--packs') ?? PACKS);
   const outPath = resolve(arg('--out') ?? resolve(OUTDIR, `L${LEVEL}_transcript.md`));
   const outFullPath = resolve(arg('--out-full') ?? resolve(OUTDIR, `L${LEVEL}_transcript_full.md`));
+  // Ground truth only on explicit request, and only after the run is closed:
+  // the flag exists so the readable truth-annotated transcript is still
+  // producible for the write-up, without ever existing during a live run.
+  const revealTruth = argv.includes('--reveal-truth');
 
   const records = readJsonl<CallLedgerRecord>(ledgerPath);
   if (!records.length) { console.error(`no records in ${ledgerPath}`); process.exit(1); }
   const outcomes = readJsonl<OutcomeLine>(outcomesPath);
   const packs: any[] = existsSync(packsPath) ? JSON.parse(readFileSync(packsPath, 'utf-8')) : [];
-  writeFileSync(outPath, buildTranscript(records, outcomes, packs, false));
-  writeFileSync(outFullPath, buildTranscript(records, outcomes, packs, true));
-  console.log(`wrote ${outPath}`);
-  console.log(`wrote ${outFullPath}`);
+  writeFileSync(outPath, buildTranscript(records, outcomes, packs, false, revealTruth));
+  writeFileSync(outFullPath, buildTranscript(records, outcomes, packs, true, revealTruth));
+  console.log(`wrote ${outPath}${revealTruth ? ' (ground truth REVEALED)' : ' (ground truth withheld)'}`);
+  console.log(`wrote ${outFullPath}${revealTruth ? ' (ground truth REVEALED)' : ' (ground truth withheld)'}`);
 }

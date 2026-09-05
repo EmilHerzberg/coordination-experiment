@@ -148,9 +148,20 @@ const PROVIDER_SPLIT: Record<string, string[]> = {
   'qwen3-32b@on': ['DeepInfra', 'SiliconFlow'],
 };
 
-/** Strip the "#rN" repeat suffix so all repeats of an event share its provider. */
+/**
+ * Strip the "#rN" repeat suffix AND the "_L1"/"_L2" level suffix, so all
+ * repeats and BOTH levels of an event share its provider.
+ *
+ * The level strip was missing until 2026-09-05: the runner builds ev.id as
+ * `${pack.id}_L${LEVEL}` (see the events mapping below), so hashing ev.id
+ * directly sent ~half the events to a DIFFERENT provider at L2 than at L1 —
+ * the exact opposite of what D29 documents, and it would have confounded the
+ * qwen level contrast with an endpoint change. Caught by the adversarial
+ * review of the analysis plan (REVIEW_ANALYSIS_PLAN_2026-09-05.md, L2-03);
+ * order matters: the repeat suffix is appended after the level suffix.
+ */
 export function baseEventId(id: string): string {
-  return id.replace(/#r\d+$/, '');
+  return id.replace(/#r\d+$/, '').replace(/_L\d+$/, '');
 }
 
 /** djb2, stable across processes/runs (no Math.random, no Date). */
@@ -666,8 +677,11 @@ const realPacks: RealPack[] = PACKS_PATH ? (JSON.parse(readFileSync(PACKS_PATH, 
 
 const events: EvidencePack[] = PACKS_PATH
   ? realPacks.map(p => ({
-      // The label and the realised return are NEVER put into an evidence pack:
-      // they live only in the outcome file, so no model can read its own answer.
+      // The {id, text} object handed to the ladder never carries the label or
+      // the realised return, so no model can read the answer. Be precise about
+      // where the truth DOES live at run time: in the packs JSON on disk (the
+      // pack builder writes label/abnormalReturn there) — not in any file this
+      // runner writes. The analysis plan's blinding wording follows from that.
       id: `${p.id}_L${LEVEL}`,
       text: LEVEL === 2 ? p.level2 : p.level1,
     }))
@@ -922,7 +936,12 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
         // The ledger records go down first and the outcomes line LAST: that ordering is
         // what makes a missing outcomes line mean "interrupted", which resume relies on.
         for (const r of res.ledger.records) appendFileSync(P.ledger, JSON.stringify(r) + '\n');
-        appendFileSync(P.outcomes, JSON.stringify({ modelKey: m.key, eventId: ev.id, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities, matched: res.matched, repetitionRuns: res.repetitionRuns }) + '\n');
+        // `provider` makes the D29 split auditable per event (the analysis
+        // plan's provider-invariance check needs it in the outcomes, not only
+        // in the raw log); `aggregatorNumberLeaks` persists the D27 residual
+        // leak count, which was computed per event but discarded until
+        // 2026-09-05 (review finding L2-12).
+        appendFileSync(P.outcomes, JSON.stringify({ modelKey: m.key, eventId: ev.id, provider, outcomes: res.outcomes, roundProbabilities: res.roundProbabilities, matched: res.matched, repetitionRuns: res.repetitionRuns, aggregatorNumberLeaks: res.aggregatorNumberLeaks }) + '\n');
         const line = STRUCTURES.map(s => {
           const o = res.outcomes[s];
           const t = summarize(structureRecords(res.ledger.records, s), COMBINER_ROLES);

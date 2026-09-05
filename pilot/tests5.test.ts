@@ -9,6 +9,7 @@ import { Ledger5, localTokens, summarize, splitTokens, MalformedCallError, type 
 import { workerPrompt, aggregatorPrompt, debateRevisePrompt, reasonStatesOwnNumber } from './prompts.js';
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 import { buildStructureTokens } from './make-structure-tokens.js';
+import { buildTranscript } from './make-transcript.js';
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1017,17 +1018,41 @@ test('resume: a full run generates the four artefacts under its own level prefix
   assert.equal(meta.ledgerLines, lines(P.ledger).length);
   // 2 events x 1 model x 3 structures, and every event that ran is present.
   assert.equal(lines(P.structureTokens).length - 1, 6);
+  // Blinding (2026-09-05): no artefact a full run writes may join a forecast to
+  // its outcome. The ground-truth block is opt-in via --reveal-truth only.
+  assert.ok(!readFileSync(P.transcript, 'utf-8').includes('Ground truth'),
+    'a run-time transcript must not contain the ground truth');
+  assert.ok(!readFileSync(P.transcriptFull, 'utf-8').includes('Ground truth'));
+});
+
+// ---- 8b. the ground-truth gate itself, on a pack that WOULD reveal it
+test('transcript: ground truth appears only with revealTruth, never by default', () => {
+  const records = [{
+    ok: true, modelKey: 'm', eventId: 'AAPL_2024Q1_L1', agentRole: 'worker_1',
+    responseText: '<reason>r</reason><decision>0.6</decision>', reasoningText: '',
+  }] as any;
+  const packs = [{ id: 'AAPL_2024Q1', symbol: 'AAPL', reportDate: '2024-01-01',
+    t0: '2024-01-01', label: 1, abnormalReturn: 0.0123 }];
+  const closed = buildTranscript(records, [], packs, false);
+  const revealed = buildTranscript(records, [], packs, false, true);
+  assert.ok(!closed.includes('Ground truth'),
+    'default rendering must withhold the label even when the pack carries it');
+  assert.ok(revealed.includes('Ground truth') && revealed.includes('POSITIVE (label 1)'),
+    'the post-run rendering must still be able to show it');
 });
 
 // ---- 9. a builder failure costs the artefact, never the run
 test('resume: a failing report builder does not fail the run, but is not silent either', async () => {
   const dir = scratchDir('builderfail');
   const P = outputPaths(dir, 1);
-  // A pack whose ground-truth field blows up when the transcript builder reads
-  // it. What breaks does not matter; that the ladder runs are untouched by it
-  // does — they already cost real money and are already on disk.
-  const boom = [{ id: 'AAPL_2024Q1', symbol: 'AAPL', reportDate: '2024-01-01', t0: '2024-01-01', label: 1,
-    get abnormalReturn(): number { throw new Error('simulated builder failure'); } }];
+  // A pack whose header field blows up when the transcript builder reads it.
+  // What breaks does not matter; that the ladder runs are untouched by it
+  // does — they already cost real money and are already on disk. (The trap sat
+  // on `abnormalReturn` until 2026-09-05; the run-time builder no longer reads
+  // the ground-truth fields at all — that is the blinding fix — so the trap
+  // moved to `reportDate`, which the header line still reads.)
+  const boom = [{ id: 'AAPL_2024Q1', symbol: 'AAPL', t0: '2024-01-01', label: 1, abnormalReturn: 0.01,
+    get reportDate(): string { throw new Error('simulated builder failure'); } }];
   const res = await runMock(dir, { packs: boom as any });
 
   assert.equal(res.completed, 2, 'the expensive part succeeded and must be reported as such');
