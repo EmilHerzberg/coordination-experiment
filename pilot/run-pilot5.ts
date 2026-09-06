@@ -4,6 +4,7 @@
 //   node --experimental-transform-types --import ./register.mjs run-pilot5.ts probe     (1 model × 1 event, real calls)
 //   node --experimental-transform-types --import ./register.mjs run-pilot5.ts full      (all models × events)
 //   node --experimental-transform-types --import ./register.mjs run-pilot5.ts full --fresh   (throw the level away and restart)
+//   PILOT5_EVENT_LIMIT=50 ... run-pilot5.ts full   (D32: only the first 50 events of the shuffled order; resume lifts it)
 //
 // `estimate` makes NO network calls: it prices the prompts with the local
 // tokenizer and the per-model $/M rates from models_verified.md, assuming an
@@ -57,6 +58,14 @@ const CAP_USD = Number(process.env.PILOT5_CAP_USD ?? '2.0');   // hard stop; con
 const CONCURRENCY = Number(process.env.PILOT5_CONCURRENCY ?? '6');
 // Repeat the whole event set N times, to get sample size on rare failures.
 const REPEATS = Math.max(1, Number(process.env.PILOT5_REPEATS ?? '1'));
+// D32 (2026-09-06): the pre-declared operational checkpoint. When set, the
+// work list is cut to the first N DISTINCT events of the seed-shuffled order of
+// the FULL task list (both models; the same N events at both levels), so the
+// real run can be paused after its first N events for a BLIND operational
+// check — do the APIs answer, does anything break, what does a ladder cost in
+// money and minutes. Lifting the variable is an ordinary resume: the N events
+// are on disk and skipped, the remaining ones run. See checkpointEvents().
+const EVENT_LIMIT = process.env.PILOT5_EVENT_LIMIT ? Math.max(1, Math.floor(Number(process.env.PILOT5_EVENT_LIMIT))) : null;
 
 export interface ModelSpec {
   key: string; slug: string; provider: string; mode: ReasoningMode;
@@ -441,6 +450,29 @@ export function shuffleInPlace<T>(arr: T[], seed: number): T[] {
   return arr;
 }
 
+/** The one seed of the work order (D31/II-8). Also the seed the checkpoint set is derived from (D32). */
+export const WORK_ORDER_SEED = 20260905;
+
+/**
+ * The base events of the first `n` distinct events in the seed-shuffled order of
+ * the FULL task list (D32). Level-invariant by construction: the task lists of
+ * L1 and L2 have the same length and the same (model, pack) layout, ids differ
+ * only by the level suffix that baseEventId() strips, and the shuffle permutes
+ * indices — so both levels pick the same companies and quarters. Independent
+ * of what is already on disk, so a resume sees the same set.
+ */
+export function checkpointEvents<T extends { m: { key: string }; ev: { id: string } }>(
+  tasks: readonly T[],
+  n: number,
+): Set<string> {
+  const keep = new Set<string>();
+  for (const t of shuffleInPlace([...tasks], WORK_ORDER_SEED)) {
+    if (keep.size >= n) break;
+    keep.add(baseEventId(t.ev.id));
+  }
+  return keep;
+}
+
 export function planWork<T extends { m: { key: string }; ev: { id: string } }>(
   tasks: readonly T[],
   doneKeys: ReadonlySet<string>,
@@ -720,8 +752,15 @@ function estimate(): void {
   console.log(`estimate: N=${N}, debate rounds=${R}, assumed out/call: ${JSON.stringify(OUT)}\n`);
   console.log('| model | events | calls | ~prompt tok | ~completion tok | ~$ |');
   console.log('|---|---:|---:|---:|---:|---:|');
+  // D32: with PILOT5_EVENT_LIMIT set, price exactly the checkpoint set.
+  const keep = EVENT_LIMIT !== null
+    ? checkpointEvents(MODELS.flatMap(m => events.map(ev => ({ m, ev }))), EVENT_LIMIT)
+    : null;
+  if (keep) console.log(`event limit ${EVENT_LIMIT} (D32 checkpoint): pricing ${keep.size} of ${events.length} events
+`);
   for (const m of MODELS) {
-    const evs = m.evidence === 'all' ? events : events.slice(0, 1);
+    const pool = keep ? events.filter(ev => keep.has(baseEventId(ev.id))) : events;
+    const evs = m.evidence === 'all' ? pool : pool.slice(0, 1);
     let pTok = 0, cTok = 0, calls = 0;
     const out = OUT[m.arm];
     for (const ev of evs) {
@@ -801,6 +840,8 @@ export interface RunOptions {
   capUsd?: number;
   concurrency?: number;
   repeats?: number;
+  /** D32 checkpoint: run only the first N distinct events of the shuffled order. */
+  eventLimit?: number | null;
   events?: EvidencePack[];
   packs?: RealPack[];
   models?: ModelSpec[];
@@ -822,6 +863,7 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
   const capUsd = opts.capUsd ?? CAP_USD;
   const concurrency = opts.concurrency ?? CONCURRENCY;
   const repeats = opts.repeats ?? REPEATS;
+  const eventLimit = opts.eventLimit === undefined ? EVENT_LIMIT : opts.eventLimit;
   const evs0 = opts.events ?? events;
   const roster = (opts.models ?? MODELS).filter(m => modelKeys.includes(m.key));
 
@@ -918,7 +960,15 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
           .map(ev => ({ m, ev: rep === 0 ? ev : { ...ev, id: `${ev.id}#r${rep + 1}` } })),
       ).flat(),
     );
-    const { todo: tasks, skipped } = planWork(allTasks, doneKeys);
+    // D32: the checkpoint cut, if one is set. Applied to the FULL list before
+    // the done-set is removed, so the set does not depend on what is on disk.
+    let work = allTasks;
+    if (eventLimit !== null) {
+      const keep = checkpointEvents(allTasks, eventLimit);
+      work = allTasks.filter(t => keep.has(baseEventId(t.ev.id)));
+      status(`event limit ${eventLimit} (D32 checkpoint): ${keep.size} events = ${work.length} of ${allTasks.length} ladder runs; lift PILOT5_EVENT_LIMIT to resume the rest`);
+    }
+    const { todo: tasks, skipped } = planWork(work, doneKeys);
     // D31/II-8 (2026-09-05): the work list is SHUFFLED with a fixed seed, so an
     // early close (cost cap, kill) leaves an ~random subset of events instead
     // of an alphabetical prefix "A to somewhere" — and, as a bonus, the models
@@ -931,8 +981,8 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
     // deterministic, so resumes see the same order; and it does not touch the
     // within-event generation order of the repetition pool, which is what
     // compute matching consumes.
-    shuffleInPlace(tasks, 20260905);
-    if (skipped.length) status(`resuming: ${skipped.length} of ${allTasks.length} done, ${tasks.length} to go`);
+    shuffleInPlace(tasks, WORK_ORDER_SEED);
+    if (skipped.length) status(`resuming: ${skipped.length} of ${work.length} done, ${tasks.length} to go`);
     status(`${tasks.length} ladder runs over ${roster.length} models, concurrency ${concurrency}, order seed-shuffled (D31)`);
 
     // ---- calibration first, sequentially: one cheap probe per model (D18).
@@ -1019,7 +1069,7 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
     // would exist only to be mistaken for one.
     const artefactsOk = mode === 'full' ? writeArtefacts(P, opts.packs ?? realPacks, status) : true;
 
-    return { planned: allTasks.length, skipped: skipped.length, completed: done, dropped, purgedLedger, purgedRaw, artefactsOk };
+    return { planned: work.length, skipped: skipped.length, completed: done, dropped, purgedLedger, purgedRaw, artefactsOk };
   } finally {
     releaseLock();
   }

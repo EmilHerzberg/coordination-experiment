@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   run, planWork, completedKeys, purgeOrphans, purgeFile, taskKey, outputPaths, ledgerKeyOf,
+  checkpointEvents, WORK_ORDER_SEED, shuffleInPlace, baseEventId,
   rawKeyOf, wantsFresh, isPidAlive, acquireLock, readLockInfo,
   encodeModelKey, decodeModelKey, overheadPathFor, readOverhead,
   type ModelSpec, type LadderClient, type RunOptions, type PurgeIO,
@@ -1564,4 +1565,58 @@ test('audit: reasonStatesOwnNumber matches whole numbers, not substrings of othe
     assert.equal(reasonStatesOwnNumber(`a ${pct}% chance`, p), true,
       `a bare ${pct}% must flag ${p}`);
   }
+});
+
+// ==========================================================================
+// D32 — the pre-declared operational checkpoint (PILOT5_EVENT_LIMIT)
+//
+// The real run may be PAUSED after its first N events for a blind operational
+// check (APIs answer, nothing breaks, cost and time per ladder). "First N
+// events" must mean the same thing at both levels, on both models, and on
+// every resume: the first N DISTINCT base events in the seed-shuffled order of
+// the FULL task list — not the first N packs by date, which evLimit gives.
+// ==========================================================================
+
+test('checkpoint: the first N distinct events of the shuffled order, both models, same set at both levels', () => {
+  const mk = (key: string, id: string) => ({ m: { key }, ev: { id } });
+  const ids = ['E1', 'E2', 'E3', 'E4', 'E5', 'E6'];
+  const tasksL1 = ['qwen', 'deepseek'].flatMap(k => ids.map(id => mk(k, `${id}_L1`)));
+  const tasksL2 = ['qwen', 'deepseek'].flatMap(k => ids.map(id => mk(k, `${id}_L2`)));
+
+  const keep = checkpointEvents(tasksL1, 3);
+  assert.equal(keep.size, 3, 'exactly N base events');
+  // Reference: walk the shuffled full list and take base ids as they appear.
+  const order = shuffleInPlace([...tasksL1], WORK_ORDER_SEED).map(t => baseEventId(t.ev.id));
+  const expected = [...new Set(order)].slice(0, 3);
+  assert.deepEqual([...keep].sort(), [...expected].sort());
+  // A set derived from the FULL list is not the alphabetical prefix.
+  assert.notDeepEqual([...keep].sort(), ['E1', 'E2', 'E3'], 'must follow the shuffle, not the pack order');
+  // Level-invariant: the two levels pick the same companies and quarters.
+  assert.deepEqual([...checkpointEvents(tasksL2, 3)].sort(), [...keep].sort());
+  // Restricting the task list keeps BOTH models for every kept event.
+  const limited = tasksL1.filter(t => keep.has(baseEventId(t.ev.id)));
+  assert.equal(limited.length, 6, '3 events x 2 models');
+  for (const id of keep) assert.equal(limited.filter(t => baseEventId(t.ev.id) === id).length, 2);
+  // Asking for more than there are events is the whole set, never an error.
+  assert.equal(checkpointEvents(tasksL1, 99).size, 6);
+});
+
+test('checkpoint: eventLimit books only the checkpoint events, and lifting it resumes the rest', async () => {
+  const dir = scratchDir('checkpoint');
+  const P = outputPaths(dir, 1);
+  const six = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF'].map(s => ({ id: `${s}_2025-01-01_L1`, text: `FICTIONAL ${s} reported.` }));
+
+  const first = await runMock(dir, { events: six, eventLimit: 2 });
+  assert.equal(first.planned, 2, 'the plan is the checkpoint, not the whole pool');
+  assert.equal(first.completed, 2);
+  const booked = lines(P.outcomes).map(l => baseEventId(JSON.parse(l).eventId));
+  const expected = checkpointEvents(six.map(ev => ({ m: MOCK_MODEL, ev })), 2);
+  assert.deepEqual(booked.sort(), [...expected].sort(), 'exactly the checkpoint set, nothing else');
+  assert.ok(lines(P.status).some(l => /event limit 2/.test(l)), 'the status log states the limit');
+
+  // Lifting the limit is an ordinary resume: nothing is re-run, the rest runs.
+  const second = await runMock(dir, { events: six });
+  assert.equal(second.skipped, 2);
+  assert.equal(second.completed, 4);
+  assert.equal(lines(P.outcomes).length, 6);
 });
