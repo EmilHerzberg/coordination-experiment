@@ -1018,6 +1018,9 @@ test('resume: a full run generates the four artefacts under its own level prefix
   assert.equal(meta.ledgerLines, lines(P.ledger).length);
   // 2 events x 1 model x 3 structures, and every event that ran is present.
   assert.equal(lines(P.structureTokens).length - 1, 6);
+  // IV-2 (D31): the session header records the harness version.
+  assert.ok(lines(P.status).some(l => l.includes('harness=')),
+    'the status header must record the harness commit');
   // Blinding (2026-09-05): no artefact a full run writes may join a forecast to
   // its outcome. The ground-truth block is opt-in via --reveal-truth only.
   assert.ok(!readFileSync(P.transcript, 'utf-8').includes('Ground truth'),

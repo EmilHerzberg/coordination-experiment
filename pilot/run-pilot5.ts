@@ -16,6 +16,7 @@
 // relied on the operator renaming them: that produced six pairs of byte-
 // identical duplicates in pilot5/ and left `ledger_report_v2.md` describing a
 // DIFFERENT run than the `ledger5.jsonl` sitting next to it.
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, writeFileSync, readFileSync, renameSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { hostname } from 'node:os';
@@ -840,7 +841,15 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
 
     // One header line per SESSION, appended. Reading the status file top to
     // bottom now tells you how many times the run was interrupted and restarted.
-    status(`=== ${mode.toUpperCase()} session ${new Date().toISOString()} cap=$${capUsd} level=${level} evidence=${PACKS_PATH ? 'REAL' : 'synthetic'} concurrency=${concurrency} repeats=${repeats} ===`);
+    // IV-2 (D31): the harness version is part of the run record. Same lookup
+    // as make-structure-tokens' provenance header; 'unknown' must never block
+    // a run (version recording is bookkeeping, not a gate).
+    let harnessCommit = 'unknown';
+    try {
+      harnessCommit = execFileSync('git', ['rev-parse', '--short', 'HEAD'],
+        { cwd: dirname(fileURLToPath(import.meta.url)), encoding: 'utf-8' }).trim();
+    } catch { /* not a git checkout; recorded as unknown */ }
+    status(`=== ${mode.toUpperCase()} session ${new Date().toISOString()} cap=$${capUsd} level=${level} evidence=${PACKS_PATH ? 'REAL' : 'synthetic'} concurrency=${concurrency} repeats=${repeats} harness=${harnessCommit} ===`);
 
     // A cache written by an older build is split into per-model files before
     // anything reads it, so no measurement that was paid for is orphaned.
