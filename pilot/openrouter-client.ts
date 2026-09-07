@@ -130,9 +130,14 @@ export class OpenRouterClient implements LLMClient {
     // an entire event (a failed worker drops all three rungs, D16).
     const maxRateLimitAttempts = this.opts.rateLimitAttempts ?? 6;
     const maxAttempts = 3 + maxRateLimitAttempts;
-    await this.takeSlot();
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       attempts = attempt + 1;
+      // EVERY attempt queues behind the shared throttle (D32 deviation 1,
+      // 2026-09-07). Until then only the first attempt took a slot, so a 429
+      // retry re-hit the provider outside the spacing the throttle exists to
+      // enforce - and under sustained load that fed the very rate limit it was
+      // retrying against. The backoff sleeps below still apply on top.
+      await this.takeSlot();
       try {
         const resp = await fetch(OPENROUTER_URL, {
           method: 'POST',

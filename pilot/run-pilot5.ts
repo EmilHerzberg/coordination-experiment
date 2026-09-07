@@ -75,6 +75,19 @@ export interface ModelSpec {
   priceIn: number; priceOut: number;
   /** Minimum spacing between request starts (ms). See the 429 note on MODELS. */
   minIntervalMs?: number;
+  /**
+   * Per-provider override of minIntervalMs for a split model (D29). Added
+   * 2026-09-07 as D32 deviation 1: 15 h into the real run DeepInfra throttled
+   * qwen into a retry spiral (12 outages/h, ~half of its calls needing 429
+   * retries) while SiliconFlow ran clean at 3 s, and the retrying ladders
+   * clogged the concurrency slots of BOTH levels. A rate setting only.
+   */
+  minIntervalMsByProvider?: Record<string, number>;
+}
+
+/** The request spacing for one model on one provider: the provider override, else the model's, else none. */
+export function throttleIntervalFor(m: ModelSpec, provider: string): number {
+  return m.minIntervalMsByProvider?.[provider] ?? m.minIntervalMs ?? 0;
 }
 
 // EXPERIMENT ROSTER — decided 2026-08-26 (D20). Two open-weight families, one
@@ -95,7 +108,7 @@ export const MODELS: ModelSpec[] = [
   // 0%% for deepseek at 3s. One failed call drops a whole ~18-call event, so every
   // event was lost. The throttle is per-model per-PROCESS, so two concurrent
   // levels halve the effective spacing again. Match deepseek. See testrun10.
-  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 3000 },
+  { key: 'qwen3-32b@on',          slug: 'qwen/qwen3-32b',                 provider: 'DeepInfra', mode: 'reason_on', arm: 'reasoning',     evidence: 'all', priceIn: 0.08, priceOut: 0.28, minIntervalMs: 3000, minIntervalMsByProvider: { DeepInfra: 6000 } },
   // RE-PINNED 2026-08-28 (D24) from DeepInfra fp4 to SiliconFlow fp8.
   //
   // DeepInfra returned BYTE-IDENTICAL text for concurrent identical prompts —
@@ -907,7 +920,7 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
     const throttles = new Map<string, Throttle>();
     for (const m of roster) {
       for (const provider of PROVIDER_SPLIT[m.key] ?? [m.provider]) {
-        throttles.set(throttleKey(m.key, provider), new Throttle(m.minIntervalMs ?? 0));
+        throttles.set(throttleKey(m.key, provider), new Throttle(throttleIntervalFor(m, provider)));
       }
     }
 

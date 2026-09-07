@@ -16,12 +16,12 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   run, planWork, completedKeys, purgeOrphans, purgeFile, taskKey, outputPaths, ledgerKeyOf,
-  checkpointEvents, WORK_ORDER_SEED, shuffleInPlace, baseEventId,
+  checkpointEvents, WORK_ORDER_SEED, shuffleInPlace, baseEventId, MODELS, throttleIntervalFor,
   rawKeyOf, wantsFresh, isPidAlive, acquireLock, readLockInfo,
   encodeModelKey, decodeModelKey, overheadPathFor, readOverhead,
   type ModelSpec, type LadderClient, type RunOptions, type PurgeIO,
 } from './run-pilot5.js';
-import { CostCapError } from './openrouter-client.js';
+import { CostCapError, Throttle, OpenRouterClient } from './openrouter-client.js';
 
 // ------------------------------------------------------------------ mock
 type Script = (req: GenerateRequest, n: number) => { content: string; reasoning?: string; reasoningTokens?: number; finishReason?: string };
@@ -1619,4 +1619,57 @@ test('checkpoint: eventLimit books only the checkpoint events, and lifting it re
   assert.equal(second.skipped, 2);
   assert.equal(second.completed, 4);
   assert.equal(lines(P.outcomes).length, 6);
+});
+
+// ==========================================================================
+// D32 deviation 1 (2026-09-07): DeepInfra throttled qwen into a retry spiral
+// during the real run. Two rate-only fixes, both infrastructure:
+//   (1) EVERY attempt takes a throttle slot, not only the first — a retry that
+//       skips the queue is exactly the burst the throttle exists to prevent;
+//   (2) the spacing can differ per provider for a split model (qwen@DeepInfra
+//       gets 6 s, everything else keeps 3 s).
+// ==========================================================================
+
+test('throttle: a retried call takes a slot for EVERY attempt, not only the first', async () => {
+  class CountingThrottle extends Throttle {
+    takes = 0;
+    override async take() { this.takes++; await super.take(); }
+  }
+  const throttle = new CountingThrottle(0);
+  const dir = scratchDir('throttle');
+  const okBody = JSON.stringify({
+    id: 'gen-1', provider: 'mock',
+    choices: [{ message: { content: '<reason>r</reason><decision>0.5</decision>' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0 },
+  });
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return calls === 1
+      ? new Response('upstream busy', { status: 503 })
+      : new Response(okBody, { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const client = new OpenRouterClient({
+      modelKey: 'mock', modelSlug: 'mock/mock', provider: 'mock', mode: 'none', apiKey: 'x',
+      logPath: join(dir, 'raw.jsonl'), cost: { spentUsd: 0, capUsd: 1 }, throttle,
+    });
+    client.beginStructureRun('ladder', 'E1');
+    const res = await client.generate({ systemPrompt: 's', userPrompt: 'u', maxTokens: 10, temperature: 0 } as GenerateRequest);
+    assert.ok(res.text.includes('0.5'));
+    assert.equal(calls, 2, 'one 503 and one success');
+    assert.equal(throttle.takes, 2, 'the retry must queue behind the throttle like any other request');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('throttle: the spacing is per provider for a split model, per model otherwise', () => {
+  const qwen = MODELS.find(m => m.key === 'qwen3-32b@on')!;
+  const deepseek = MODELS.find(m => m.key === 'deepseek-chat-v3-0324')!;
+  assert.equal(throttleIntervalFor(qwen, 'DeepInfra'), 6000, 'DeepInfra throttled the real run (D32 deviation 1)');
+  assert.equal(throttleIntervalFor(qwen, 'SiliconFlow'), 3000, 'SiliconFlow ran clean at 3 s');
+  assert.equal(throttleIntervalFor(deepseek, 'SiliconFlow'), 3000);
+  assert.equal(throttleIntervalFor(MOCK_MODEL, 'mock'), 0, 'no spacing configured means none');
 });
