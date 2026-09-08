@@ -22,7 +22,7 @@ import { appendFileSync, writeFileSync, readFileSync, renameSync, unlinkSync, mk
 import { basename, dirname, resolve } from 'node:path';
 import { hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { OpenRouterClient, CostCapError, Throttle, type ReasoningMode, type CostState } from './openrouter-client.js';
+import { OpenRouterClient, CostCapError, Throttle, withDeadline, type ReasoningMode, type CostState } from './openrouter-client.js';
 import { getKey } from './env.js';
 import { EVIDENCE_BLOCKS } from './evidence.js';
 import { runLadder, structureRecords, STRUCTURES, COMBINER_ROLES, type LadderParams } from './structures5.js';
@@ -65,6 +65,11 @@ const REPEATS = Math.max(1, Number(process.env.PILOT5_REPEATS ?? '1'));
 // check — do the APIs answer, does anything break, what does a ladder cost in
 // money and minutes. Lifting the variable is an ordinary resume: the N events
 // are on disk and skipped, the remaining ones run. See checkpointEvents().
+// D32 deviation 3 (2026-09-08): a ladder that does not complete within this
+// wall-clock budget is treated as an OUTAGE (FAIL line, no outcomes line,
+// retried on the next resume). Found after 21 h of the real run: 8 of 10 slots
+// per level were silently hung. Real ladders take 3-40 min; 60 min is generous.
+const LADDER_TIMEOUT_MS = Number(process.env.PILOT5_LADDER_TIMEOUT_MS ?? String(60 * 60 * 1000));
 const EVENT_LIMIT = process.env.PILOT5_EVENT_LIMIT ? Math.max(1, Math.floor(Number(process.env.PILOT5_EVENT_LIMIT))) : null;
 
 export interface ModelSpec {
@@ -855,6 +860,8 @@ export interface RunOptions {
   repeats?: number;
   /** D32 checkpoint: run only the first N distinct events of the shuffled order. */
   eventLimit?: number | null;
+  /** D32 deviation 3: wall-clock watchdog per ladder, ms. */
+  ladderTimeoutMs?: number;
   events?: EvidencePack[];
   packs?: RealPack[];
   models?: ModelSpec[];
@@ -877,6 +884,7 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
   const concurrency = opts.concurrency ?? CONCURRENCY;
   const repeats = opts.repeats ?? REPEATS;
   const eventLimit = opts.eventLimit === undefined ? EVENT_LIMIT : opts.eventLimit;
+  const ladderTimeoutMs = opts.ladderTimeoutMs ?? LADDER_TIMEOUT_MS;
   const evs0 = opts.events ?? events;
   const roster = (opts.models ?? MODELS).filter(m => modelKeys.includes(m.key));
 
@@ -1038,7 +1046,19 @@ async function run(modelKeys: string[], evLimit: number | null, opts: RunOptions
       client.beginStructureRun('ladder', ev.id);
       const t0 = Date.now();
       try {
-        const res = await runLadder(client, ev, m.key, paramsByModel.get(m.key)!);
+        // Watchdog (D32 deviation 3): a hung ladder must fail like an outage,
+        // not hold a slot forever. The abandoned ladder's promise keeps running
+        // in the background but nothing below ever reads it, so it can never
+        // write a ledger record or an outcomes line.
+        const res = await withDeadline(
+          runLadder(client, ev, m.key, paramsByModel.get(m.key)!),
+          ladderTimeoutMs,
+        ).catch((e: unknown) => {
+          if (e instanceof Error && /\(deadline\)/.test(e.message)) {
+            throw new Error(`ladder watchdog: no completion within ${Math.round(ladderTimeoutMs / 60000)} min`);
+          }
+          throw e;
+        });
         // appendFileSync is synchronous, so concurrent writers cannot interleave a line.
         // The ledger records go down first and the outcomes line LAST: that ordering is
         // what makes a missing outcomes line mean "interrupted", which resume relies on.

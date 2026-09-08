@@ -43,6 +43,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise(res => setTimeout(res, ms));
 }
 
+/**
+ * Race a promise against OUR OWN timer (D32 deviation 3, 2026-09-08). The
+ * signal handed to fetch is not enough: 21 h into the real run, 8 of 10 slots
+ * per level were hung on a call that never settled, never logged, held no
+ * socket and never timed out. Whatever the cause inside the HTTP stack, a
+ * wall-clock race makes the attempt fail like any other outage and lets the
+ * retry loop continue. The loser keeps running in the background; its late
+ * result, if any, is simply never read.
+ */
+export function withDeadline<T>(p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try { onTimeout?.(); } catch { /* best effort */ }
+      reject(new Error(`no response within ${ms} ms (deadline)`));
+    }, ms);
+  });
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
 export class OpenRouterClient implements LLMClient {
   private seq = 0;
   private curConfig = 'unknown';
@@ -76,6 +96,8 @@ export class OpenRouterClient implements LLMClient {
       throttle?: Throttle;
       /** Extra attempts allowed for 429 specifically (rate limits need patience). */
       rateLimitAttempts?: number;
+      /** Hard wall-clock deadline per HTTP attempt, ms (default 180000). See withDeadline(). */
+      attemptTimeoutMs?: number;
     },
   ) {
     this.ownThrottle = opts.throttle ?? new Throttle(opts.minIntervalMs ?? 0);
@@ -139,22 +161,30 @@ export class OpenRouterClient implements LLMClient {
       // retrying against. The backoff sleeps below still apply on top.
       await this.takeSlot();
       try {
-        const resp = await fetch(OPENROUTER_URL, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${this.opts.apiKey}`,
-            'Content-Type': 'application/json',
-            'X-Title': 'thesis-coordination-pilot',
-          },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(180000), // 180s per attempt; covers long reasoning streams (deepseek-r1)
-        });
-        status = resp.status;
-        if (resp.ok) {
-          data = await resp.json();
+        // The AbortController is held strongly by this closure for the whole
+        // attempt; the deadline race below is what actually bounds the wait.
+        const ac = new AbortController();
+        const timeoutMs = this.opts.attemptTimeoutMs ?? 180000; // covers long reasoning streams (deepseek-r1)
+        const outcome = await withDeadline((async () => {
+          const resp = await fetch(OPENROUTER_URL, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${this.opts.apiKey}`,
+              'Content-Type': 'application/json',
+              'X-Title': 'thesis-coordination-pilot',
+            },
+            body: JSON.stringify(body),
+            signal: ac.signal,
+          });
+          if (resp.ok) return { status: resp.status, data: await resp.json() as any, errText: '' };
+          return { status: resp.status, data: null, errText: await resp.text() };
+        })(), timeoutMs, () => ac.abort());
+        status = outcome.status;
+        if (outcome.data) {
+          data = outcome.data;
           break;
         }
-        errText = await resp.text();
+        errText = outcome.errText;
         if (status === 429) {
           rateLimited++;
           if (rateLimited > maxRateLimitAttempts) break;

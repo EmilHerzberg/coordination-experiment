@@ -1665,6 +1665,68 @@ test('throttle: a retried call takes a slot for EVERY attempt, not only the firs
   }
 });
 
+// ==========================================================================
+// D32 deviation 3 (2026-09-08): 8 of 10 slots per level were found HUNG after
+// 21 h — ladders whose next call never settled, never logged, held no socket,
+// and never timed out. Two independent guards, both wall-clock:
+//   (1) every HTTP attempt has a hard deadline enforced by our own timer (a
+//       Promise.race), not only by the signal handed to fetch;
+//   (2) every ladder has a watchdog in the runner; a ladder that does not
+//       complete in time is an OUTAGE (FAIL line, no outcomes line, retried on
+//       the next resume) — never a silent dead slot.
+// ==========================================================================
+
+test('deadline: an HTTP attempt that never settles is abandoned by our own timer and retried', async () => {
+  const dir = scratchDir('deadline');
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (() => { calls++; return new Promise<Response>(() => { /* never settles, ignores the signal */ }); }) as typeof fetch;
+  try {
+    const client = new OpenRouterClient({
+      modelKey: 'mock', modelSlug: 'mock/mock', provider: 'mock', mode: 'none', apiKey: 'x',
+      logPath: join(dir, 'raw.jsonl'), cost: { spentUsd: 0, capUsd: 1 },
+      attemptTimeoutMs: 40, rateLimitAttempts: 0,
+    });
+    client.beginStructureRun('ladder', 'E1');
+    const t0 = Date.now();
+    await assert.rejects(
+      client.generate({ systemPrompt: 's', userPrompt: 'u', maxTokens: 10, temperature: 0 } as GenerateRequest),
+      /OpenRouter call failed/,
+    );
+    assert.ok(Date.now() - t0 < 15000, 'must give up in bounded time');
+    assert.equal(calls, 3, 'every attempt was tried and abandoned in turn (3 = base attempts with no 429 budget)');
+    const failed = lines(join(dir, 'raw.jsonl')).map(l => JSON.parse(l)).filter(r => r.ok === false);
+    assert.equal(failed.length, 1, 'the failure is logged once, like any other outage');
+    assert.match(failed[0].error, /deadline/, 'and names the deadline as the cause');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('watchdog: a ladder that never completes becomes an outage, and the run goes on', async () => {
+  const dir = scratchDir('watchdog');
+  const P = outputPaths(dir, 1);
+  const hung = EVENTS[1].id;
+  // One wrapper PER ladder (run() calls makeClient per task); a shared one
+  // would let the second task's beginStructureRun overwrite the first's id.
+  const makeStuck = (): LadderClient => {
+    const client = mockLadderClient(P.raw);
+    let evId = '';
+    return {
+      beginStructureRun(c, e) { evId = e; client.beginStructureRun(c, e); },
+      generate(req) { return evId === hung ? new Promise(() => { /* never */ }) : client.generate(req); },
+    };
+  };
+  const t0 = Date.now();
+  const res = await runMock(dir, { makeClient: makeStuck, ladderTimeoutMs: 3000 });
+  assert.ok(Date.now() - t0 < 15000, 'the session must end; a hung ladder may not hold it open');
+  assert.equal(res.completed, 1, 'the healthy event booked');
+  assert.deepEqual(lines(P.outcomes).map(l => JSON.parse(l).eventId), [EVENTS[0].id], 'no outcomes line for the hung event');
+  const fail = lines(P.status).find(l => l.includes(hung) && l.includes('FAIL'));
+  assert.ok(fail && /watchdog/.test(fail), `the hung ladder is reported as an outage naming the watchdog, got: ${fail}`);
+  assert.ok(/retried on the next resume/.test(fail!), 'and as retryable');
+});
+
 test('throttle: the spacing is per provider for a split model, per model otherwise', () => {
   const qwen = MODELS.find(m => m.key === 'qwen3-32b@on')!;
   const deepseek = MODELS.find(m => m.key === 'deepseek-chat-v3-0324')!;
