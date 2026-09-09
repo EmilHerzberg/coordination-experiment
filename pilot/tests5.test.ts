@@ -10,7 +10,7 @@ import { workerPrompt, aggregatorPrompt, debateRevisePrompt, reasonStatesOwnNumb
 import { runLadder, structureRecords, combine, COMBINER_ROLES } from './structures5.js';
 import { buildStructureTokens } from './make-structure-tokens.js';
 import { buildTranscript } from './make-transcript.js';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -1284,6 +1284,40 @@ test('purge: a crash between the temp write and the rename leaves the original f
   assert.equal(purgeFile(path, done, ledgerKeyOf), 2);
   assert.deepEqual(lines(path).map(l => JSON.parse(l).eventId), ['E1', 'E1', 'E1', 'E1']);
   assert.ok(!existsSync(`${path}.purge.tmp`));
+});
+
+// ---- 13b. D32 deviation 4: the purge must survive a file past Node's string limit
+// On 2026-09-09 the L2 resume died at startup: L2_runs_raw.jsonl had grown to
+// 554 MB and readFileSync(path, 'utf-8') cannot build a string longer than
+// 0x1fffffe8 (≈ 512 MB) characters. The read side now goes through a Buffer;
+// the write side must never join the survivors into ONE string either, so the
+// temp file is written in chunks: `write` creates it, `append` continues it.
+test('purge: survivors are written in chunks, never as one joined string', () => {
+  const dir = scratchDir('purgechunk');
+  const path = join(dir, 'L2_runs_raw.jsonl');
+  const rows = Array.from({ length: 60 }, (_, i) =>
+    JSON.stringify({ evidence_id: i % 6 === 0 ? 'ORPHAN_L2' : 'E1_L2', model_key: 'mock', call_seq: i, pad: 'x'.repeat(40) }));
+  writeFileSync(path, rows.join('\n') + '\n');
+  const done = new Set([taskKey('E1_L2', 'mock')]);
+  const calls: string[] = [];
+  const io: PurgeIO = {
+    write: (p, d) => { calls.push(`write:${d.length}`); writeFileSync(p, d); },
+    append: (p, d) => { calls.push(`append:${d.length}`); appendFileSync(p, d); },
+    rename: (f, t) => renameSync(f, t),
+  };
+  // 300 characters per chunk: a handful of lines each, so the 50 survivors need several chunks.
+  const removed = purgeFile(path, done, rawKeyOf, io, 300);
+  assert.equal(removed, 10);
+  const expected = rows.filter(r => !r.includes('ORPHAN')).join('\n') + '\n';
+  assert.equal(readFileSync(path, 'utf-8'), expected, 'chunking changed the bytes');
+  assert.ok(calls[0].startsWith('write:'), `first chunk must CREATE the temp file, got ${calls[0]}`);
+  assert.ok(calls.filter(c => c.startsWith('append:')).length >= 3, `expected chunked appends, got ${calls.join(' ')}`);
+  for (const c of calls) assert.ok(Number(c.split(':')[1]) <= 300 + 200, `a chunk exceeded the limit by more than one line: ${c}`);
+  assert.ok(!existsSync(`${path}.purge.tmp`));
+  // CRLF input: lines are still recognised (the old regex split accepted CR LF).
+  writeFileSync(path, rows.join('\r\n') + '\r\n');
+  assert.equal(purgeFile(path, done, rawKeyOf), 10);
+  assert.equal(readFileSync(path, 'utf-8'), expected);
 });
 
 // ---- 14. the --fresh opt-out is exact

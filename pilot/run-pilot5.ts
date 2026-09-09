@@ -533,9 +533,28 @@ export function purgeOrphans<T>(
 }
 
 // --------------------------------------------------- resume, filesystem part
+/**
+ * Split a JSONL file into its lines WITHOUT ever holding the file as one
+ * string. D32 deviation 4 (2026-09-09): `L2_runs_raw.jsonl` reached 554 MB and
+ * `readFileSync(path, 'utf-8')` threw "Cannot create a string longer than
+ * 0x1fffffe8 characters" (Node's string ceiling, ≈ 512 MB) — the resume died
+ * at startup. A Buffer has no such ceiling on 64-bit Node; each line is decoded
+ * on its own. `\r\n` is accepted exactly as the old `split(/\r?\n/)` did.
+ */
 function readLines(path: string): string[] {
   if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf-8').split(/\r?\n/).filter(Boolean);
+  const buf = readFileSync(path);
+  const lines: string[] = [];
+  let start = 0;
+  for (;;) {
+    const nl = buf.indexOf(0x0a, start);
+    const end = nl === -1 ? buf.length : nl;
+    const cut = end > start && buf[end - 1] === 0x0d ? end - 1 : end;
+    if (cut > start) lines.push(buf.toString('utf-8', start, cut));
+    if (nl === -1) break;
+    start = nl + 1;
+  }
+  return lines;
 }
 
 /**
@@ -550,20 +569,35 @@ function readLines(path: string): string[] {
  *    cleaning up: orphans are detectable, a half-written line is not.
  */
 export interface PurgeIO {
+  /** Create (or truncate) `path` with the first chunk. */
   write(path: string, data: string): void;
+  /**
+   * Continue `path` with a further chunk. Optional only for the test fakes
+   * whose files fit in one chunk; the real io always has it (deviation 4).
+   */
+  append?(path: string, data: string): void;
   rename(from: string, to: string): void;
 }
 /** The real thing. Injectable only so a test can make either half fail. */
 const REAL_PURGE_IO: PurgeIO = {
   write: (p, d) => writeFileSync(p, d),
+  append: (p, d) => appendFileSync(p, d),
   rename: (f, t) => renameSync(f, t),
 };
+/**
+ * Survivors are written in chunks of at most this many characters (plus the
+ * line that crosses the boundary), so the temp file of a 554 MB raw log is
+ * never one joined string. 64 MB is far below the ceiling and large enough
+ * that a purge is still a handful of writes.
+ */
+const PURGE_CHUNK_CHARS = 64 * 1024 * 1024;
 
 export function purgeFile(
   path: string,
   doneKeys: ReadonlySet<string>,
   keyOf: (r: any) => string | null,
   io: PurgeIO = REAL_PURGE_IO,
+  chunkChars: number = PURGE_CHUNK_CHARS,
 ): number {
   const lines = readLines(path);
   if (!lines.length) return 0;
@@ -576,7 +610,27 @@ export function purgeFile(
   if (!removed.length) return 0;               // untouched file, untouched bytes
   const tmp = `${path}.purge.tmp`;
   try {
-    io.write(tmp, kept.length ? kept.map(k => k.line).join('\n') + '\n' : '');
+    // First chunk creates the temp file (an empty file if nothing survives),
+    // every further chunk is appended. A chunk is closed as soon as it reaches
+    // `chunkChars`, so it overshoots by at most one line.
+    let chunk: string[] = [];
+    let size = 0;
+    let first = true;
+    const flush = () => {
+      const data = chunk.length ? chunk.join('\n') + '\n' : '';
+      if (first) { io.write(tmp, data); first = false; }
+      else {
+        if (!io.append) throw new Error('purgeFile: survivors exceed one chunk but the PurgeIO has no append()');
+        io.append(tmp, data);
+      }
+      chunk = []; size = 0;
+    };
+    for (const k of kept) {
+      chunk.push(k.line);
+      size += k.line.length + 1;
+      if (size >= chunkChars) flush();
+    }
+    if (first || chunk.length) flush();
     io.rename(tmp, path);
   } catch (e) {
     // Whatever failed, `path` is still the ORIGINAL complete file — that is the
